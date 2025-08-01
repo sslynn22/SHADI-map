@@ -15,7 +15,7 @@ print("▶ [START] shadow_map_debug.py 실행")
 
 # ── 0. 글로벌 설정 ──────────────────────────────────────
 tz   = pytz.timezone("Asia/Seoul")
-now  = tz.localize(datetime.datetime(2024, 7, 31, 14, 0, 0))
+now  = tz.localize(datetime.datetime(2024, 7, 31, 18, 0, 0))
 CENTER = (36.355, 127.31)     # 대전 유성구
 BBOX_EXTENT      = 0.01       # 약 ±1 km
 WIDTH_RATIO_TREE = 0.3        # 나무 그림자 너비 = 높이×0.3
@@ -98,34 +98,40 @@ print(f"    → 건물 footprint {len(build):,} 개 수신")
 print("  • 건물 그림자 계산 중 …")
 bld_layers = []
 for _, row in build.iterrows():
-    poly = row.geometry                 # ← 반드시 첫 줄에 선언!
-
-    # 1) 잘못된 폴리곤 보정 → 그래도 비정상이면 패스
-    poly = make_valid(poly)
+    poly = make_valid(row.geometry)
     if poly.is_empty or not poly.is_valid or not isinstance(poly, Polygon):
         continue
 
     # 높이 추정
-    h = row.get("height")
-    if h is None:
-        lv = row.get("building:levels")
-        h = float(lv)*3 if lv else 10
+    if row.get("height"):
+        h = float(str(row["height"]).replace("m", ""))
+    elif row.get("building:levels"):
+        h = float(row["building:levels"])*3
     else:
-        h = float(str(h).replace("m", ""))
+        h = 10.0        # 기본값
+
 
     alt, azi = get_altitude(poly.centroid.y, poly.centroid.x, now), get_azimuth(poly.centroid.y, poly.centroid.x, now)
-
     try:
-        # 2) translate 도중 오류 → 건너뜀
         s_poly = make_valid(building_shadow_polygon(poly, h, alt, azi))
     except GEOSException:
         continue
-
     if s_poly.is_empty or not s_poly.is_valid:
         continue
 
     area = Polygon([proj.transform(*pt) for pt in s_poly.exterior.coords]).area
-    bld_layers.append((s_poly, f"Building shadow<br>H={h} m<br>{area:,.1f} ㎡"))
+    cent = s_poly.centroid
+    lat, lon = round(cent.y, 6), round(cent.x, 6)
+
+    tooltip_txt = (
+        f"Building shadow<br>"
+        f"Lat, Lon: {lat}, {lon}<br>"
+        f"Height: {h} m<br>"
+        f"Area: {area:,.1f} ㎡"
+    )
+    bld_layers.append((s_poly, tooltip_txt))
+    
+    area = Polygon([proj.transform(*pt) for pt in s_poly.exterior.coords]).area
 
 print(f"    → 그림자 폴리곤 {len(bld_layers):,} 개 생성")
 
@@ -139,12 +145,17 @@ for poly, tip in tree_layers:
                    style_function=lambda x: {"fillColor":"#000","color":"#000",
                                              "weight":0.4,"fillOpacity":0.35},
                    tooltip=tip).add_to(m)
+
 # 건물 그림자
 for poly, tip in bld_layers:
-    folium.GeoJson(gpd.GeoSeries([poly]).__geo_interface__,
-                   style_function=lambda x: {"fillColor":"#555","color":"#555",
-                                             "weight":0.3,"fillOpacity":0.45},
-                   tooltip=tip).add_to(m)
+    folium.GeoJson(
+        gpd.GeoSeries([poly]).__geo_interface__,
+        style_function=lambda x: {
+            "fillColor": "#555", "color": "#555",
+            "weight": 0.3, "fillOpacity": 0.45},
+        tooltip=tip
+    ).add_to(m)
+
 # 나무 위치
 folium.GeoJson(trees_gdf[["geometry"]].__geo_interface__,
                marker=folium.CircleMarker(radius=2,color="green",fill=True)).add_to(m)
