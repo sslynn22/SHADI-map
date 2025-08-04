@@ -13,9 +13,10 @@ from shapely.affinity import scale, rotate
 
 # ────────────────────────────── 기본 설정 ──────────────────────────────
 tz   = pytz.timezone("Asia/Seoul")
-now  = tz.localize(datetime.datetime(2024, 7, 31, 18, 0, 0))   # 분석 시각
-WIDTH_RATIO_TREE = 1.5                                         # 나무 그림자 폭 = 높이×1.5
+now  = tz.localize(datetime.datetime(2024, 7, 31, 15, 0, 0))   # 분석 시각
+WIDTH_RATIO_TREE = 7                                         # 나무 그림자 폭 = 높이×1.5
 proj = Transformer.from_crs(4326, 5179, always_xy=True)        # 면적(m²) 계산용
+SHELTER_SCALE = 3                                            # 쉼터 그림자 폭
 
 warnings.filterwarnings("ignore", message="I don't know about leap seconds")
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="shapely")
@@ -56,7 +57,7 @@ def tree_shadow_ellipse(lat, lon, r_m, alt, azi):
     stretch = 1 / math.tan(math.radians(alt))     # 고도 낮을수록 길어짐
     ellip   = scale(circle, 1, stretch, origin=(x0, y0))
 
-    # ─ 3) 태양과 직각이 되도록 회전 ─
+    # ─ 3) 태양과 직각이 되도록 회전 =-0987654321
     ellip   = rotate(ellip, (azi + 90) % 360, origin=(x0, y0))
 
     # ─ 4) 트렁크와 타원 앞머리가 맞게 L/2 만큼 뒤로 이동 ─
@@ -69,9 +70,45 @@ def tree_shadow_ellipse(lat, lon, r_m, alt, azi):
     shadow = transform(lambda x, y, z=None: to4326.transform(x, y), ellip)
     return make_valid(shadow)
 
+def shelter_shadow_octagon(lat, lon, diameter_m, alt, azi):
+    """
+    • diameter_m : 파라솔 지름 (m)
+    • alt, azi   : 고도각·방위각
+    반환값        : shapely Polygon (팔각형 그림자)
+    """
+    if alt <= 0:
+        return Polygon()              # 태양 고도 0 이하면 그림자 X
+
+    r = diameter_m / 2
+    # ─ A. 정팔각형 꼭짓점 (XY 평면) 생성 ─
+    angles = [math.radians(22.5 + 45*i) for i in range(8)]   # 0° 대신 22.5° 돌려 중심 정렬
+    base_pts = [( r*math.cos(th), r*math.sin(th)) for th in angles]
+    base = Polygon(base_pts)
+
+    # ─ B. 투영(늘리기) : 그림자 길이 계수 = 1/tan(alt) ─
+    stretch = 1 / math.tan(math.radians(alt))
+    shadow = scale(base, 1, stretch, origin=(0, 0))
+
+    # ─ C. 방위각 +90° 로 회전 (태양과 직각) ─
+    shadow = rotate(shadow, (azi + 90) % 360, origin=(0, 0))
+
+    # ─ D. L/2 뒤로 평행이동해서 기둥과 연결 ─
+    L = shadow_len(r, alt)
+    dx, dy = (L/2)*math.sin(math.radians(azi)), (L/2)*math.cos(math.radians(azi))
+    shadow = translate(shadow, xoff=dx, yoff=dy)
+
+    # ─ E. WGS84 좌표로 위치시키기 ─
+    to5179 = Transformer.from_crs(4326, 5179, always_xy=True)
+    to4326 = Transformer.from_crs(5179, 4326, always_xy=True)
+    cx, cy = to5179.transform(lon, lat)          # 쉼터 위치를 원점으로
+    shadow = translate(shadow, xoff=cx, yoff=cy)
+    shadow = transform(lambda x, y, z=None: to4326.transform(x, y), shadow)
+    return make_valid(shadow)
+
+
 # ────────── 0. 충남대 50 m 버퍼 ──────────
 CENTER_CNU = (36.36917, 127.34515)          # 충남대 정문 좌표 (대략)
-DIST_M     = 150                            
+DIST_M     = 1000                            
 deg = DIST_M / 111_320                      # 위도 1° ≈ 111,320 m
 buffer_50m_poly = Polygon([
     (CENTER_CNU[1]-deg, CENTER_CNU[0]-deg),
@@ -104,7 +141,7 @@ def building_shadow_polygon(poly, h, alt, azi):
     if isinstance(poly, Polygon):
         return make_valid(_shadow(poly))
     else:                                   # MultiPolygon
-        return make_valid(unary_union(_shadow(g) for g in poly.geoms))
+        return make_valid(unary_union([_shadow(g) for g in poly.geoms]))
 
 
 def geom_area_m2(geom):                        # Polygon·MultiPolygon 모두 OK
@@ -152,61 +189,124 @@ for _, r in trees_gdf.iterrows():
     tree_layers.append((poly, tip))
 print(f"    → 그림자 폴리곤 {len(tree_layers):,} 개 생성")
 
-# ───────────────────── 2. 건물 OSM → 그림자 ──────────────────────────
-try:
-    # ① 먼저 작은 버퍼(150 m)로 시도
-    build = ox.features_from_polygon(buffer_50m_poly, tags={"building": True})
-except ox._errors.InsufficientResponseError:
-    # ② 결과가 없으면 'point + dist' 방식으로 재시도
-    build = ox.features_from_point(CENTER_CNU, dist=DIST_M,
-                                   tags={"building": True})
-# 공통 후처리
-build = build.to_crs(epsg=4326).loc[~build.geometry.is_empty]
-print(f"    → 건물 footprint {len(build):,} 개 (버퍼 {DIST_M} m)")
+# ───────────────────── 1-B. 그늘막 쉼터 CSV → 그림자 ─────────────────────
+print("  • 그늘막 쉼터 CSV 로드 중 …")
+shel = pd.read_csv("data/대전광역시 유성구_그늘막쉼터_20240920.csv", encoding="euc-kr")
 
-bld_layers = []
-for _, row in build.iterrows():
-    poly = make_valid(row.geometry)
-    if poly.is_empty or not poly.is_valid or not isinstance(poly, (Polygon, MultiPolygon)):
-        continue
-    # 높이 추정
-    h = to_float_or_none(row.get("height"))
-    if h is None:
-        lv = to_float_or_none(row.get("building:levels"))
-        h = lv*3 if lv is not None else 10.0
+shel_gdf = gpd.GeoDataFrame(
+    shel.dropna(subset=["위도", "경도"]),
+    geometry=[Point(xy) for xy in zip(shel["위도"], shel["경도"])],
+    crs="EPSG:4326"
+)
+shel_gdf = gpd.clip(shel_gdf, buffer_50m_poly)   # 버퍼 범위로 자르기
+print(f"    → 쉼터 {len(shel_gdf):,} 개 (버퍼 범위)")
 
-    # 그림자
+
+# ─────────────────── 2-A. Shapefile 건물 → 보라색 그림자 ───────────────────
+print("  • Shapefile 건물 로드 중 …")
+shp_gdf = (gpd.read_file("CH_D010_00_20250731.shp", encoding="euc-kr")
+             .to_crs(epsg=4326))
+shp_gdf = shp_gdf[shp_gdf["A4"].str.contains("대전광역시", na=False)]
+shp_gdf = gpd.clip(shp_gdf, buffer_50m_poly)
+
+shp_layers = []
+for _, r in shp_gdf.iterrows():
+    poly = make_valid(r.geometry)
+    if poly.is_empty: continue
+    floors = pd.to_numeric(r.get("A25"), errors="coerce")
+    h      = floors*3 if not pd.isna(floors) else 10.0
     alt, azi = get_altitude(poly.centroid.y, poly.centroid.x, now), get_azimuth(poly.centroid.y, poly.centroid.x, now)
-    try:
-        s_poly = make_valid(building_shadow_polygon(poly, h, alt, azi))
-    except GEOSException:
+    s_poly  = building_shadow_polygon(poly, h, alt, azi)
+    if not s_poly.is_valid or s_poly.is_empty: continue
+    shp_layers.append((s_poly, f"Shapefile<br>높이≈{h:.1f} m"))
+
+print(f"    → Shapefile 그림자 {len(shp_layers):,} 개")
+
+# 셰이프 건물 합집합(중복 제거용)
+shp_union = unary_union([g for g, _ in shp_layers])
+
+shel_layers = []
+for _, r in shel_gdf.iterrows():
+    lat, lon = r["경도"], r["위도"]
+    dia = to_float_or_none(r.get("그늘막지름")) or 3.0   # 원본 지름(m)
+    dia *= SHELTER_SCALE          # ★ 여기서 지름을 1.6배 확대
+
+    alt, azi = get_altitude(lat, lon, now), get_azimuth(lat, lon, now)
+    poly = shelter_shadow_octagon(lat, lon, dia, alt, azi)  # 커진 지름 사용
+
+    if poly.is_empty: continue
+
+    area = geom_area_m2(poly)
+    tip  = (f"쉼터 팔각 그림자<br>지름≈{dia} m<br>{area:,.1f} ㎡")
+    shel_layers.append((poly, tip))
+
+# ─────────────────── 2-B. OSM 건물 → 빨간색 그림자 ───────────────────
+print("  • OSM 건물 로드 중 …")
+try:
+    osm = ox.features_from_polygon(buffer_50m_poly, tags={"building": True})
+except ox._errors.InsufficientResponseError:
+    osm = ox.features_from_point(CENTER_CNU, dist=DIST_M, tags={"building": True})
+osm = osm.to_crs(epsg=4326)
+print(f"    → OSM 건물 {len(osm):,} 개")
+
+osm_layers = []
+for _, row in osm.iterrows():
+    poly = make_valid(row.geometry)
+    if poly.is_empty or poly.intersects(shp_union):     # Shapefile과 겹치면 skip
         continue
+
+    NAME_FIX = {
+        "공과대학 2호관": 5,   # 층수 직접 지정
+        "공과대학 4호관": 3,
+    }
+    bname = row.get("name:ko") or row.get("name")
+
+    if bname in NAME_FIX:                # ① 수동 지정 우선
+        h = NAME_FIX[bname] * 3
+    else:                                # ② OSM 태그 → ③ 기본값
+        h = to_float_or_none(row.get("height"))
+        if h is None:
+            lv = to_float_or_none(row.get("building:levels"))
+            h  = lv*3 if lv else 10.0     # 기본 10 m
+
+    alt, azi = get_altitude(poly.centroid.y, poly.centroid.x, now), get_azimuth(poly.centroid.y, poly.centroid.x, now)
+    
+    # 1) 유효한 폴리곤만 남기기
+    if (poly.is_empty or poly.intersects(shp_union) or
+        not isinstance(poly, (Polygon, MultiPolygon))):
+        continue
+
+    # 2) 이제 안전하게 그림자 생성
+    s_poly = building_shadow_polygon(poly, h, alt, azi)
     if s_poly.is_empty or not s_poly.is_valid:
         continue
-    area = geom_area_m2(s_poly)
-    cent = s_poly.centroid
-    tooltip = (f"Building shadow<br>"
-               f"Lat, Lon: {cent.y:.6f}, {cent.x:.6f}<br>"
-               f"Height: {h:.1f} m<br>"
-               f"Area: {area:,.1f} ㎡")
-    bld_layers.append((s_poly, tooltip))
-print(f"    → 그림자 폴리곤 {len(bld_layers):,} 개 생성")
+    tooltip = f"OSM<br>높이≈{h:.1f} m"
+    osm_layers.append((s_poly, tooltip))
+    
+print(f"    → OSM 그림자 {len(osm_layers):,} 개")
+
 
 # ───────────────────── 3. Folium 시각화 ──────────────────────────────
 print("  • Folium 지도 생성 중 …")
 m = folium.Map(location=CENTER, zoom_start=15)
 
-# 건물 그림자 (빨간색 + 중심 마커)
-for poly, tip in bld_layers:
+# 3-A. Shapefile 건물 그림자(보라)
+for poly, tip in shp_layers:
+    folium.GeoJson(gpd.GeoSeries([poly]).__geo_interface__,
+                   style_function=lambda x: {"fillColor": "#7e3ff2",
+                                             "color": "#7e3ff2",
+                                             "weight": 0.6,
+                                             "fillOpacity": 0.55},
+                   tooltip=tip).add_to(m)
+
+# 3-B. OSM 건물 그림자(빨강)
+for poly, tip in osm_layers:
     folium.GeoJson(gpd.GeoSeries([poly]).__geo_interface__,
                    style_function=lambda x: {"fillColor": "#ff5555",
                                              "color": "#ff5555",
                                              "weight": 0.6,
                                              "fillOpacity": 0.55},
                    tooltip=tip).add_to(m)
-    c = poly.centroid
-    folium.CircleMarker((c.y, c.x), radius=4,
-                        color="red", fill=True, fill_opacity=1).add_to(m)
 
 # 나무 그림자 (파란색)
 for poly, tip in tree_layers:
@@ -221,6 +321,16 @@ for poly, tip in tree_layers:
 folium.GeoJson(trees_gdf[["geometry"]].__geo_interface__,
                marker=folium.CircleMarker(radius=2,
                                           color="green", fill=True)).add_to(m)
+
+# 그늘막 쉼터 그림자
+for poly, tip in shel_layers:
+    folium.GeoJson(gpd.GeoSeries([poly]).__geo_interface__,
+                   style_function=lambda x: {"fillColor": "#f39c12",
+                                             "color": "#f39c12",
+                                             "weight": 0.4,
+                                             "fillOpacity": 0.60},
+                   tooltip=tip).add_to(m)
+
 
 m.save("shadow_map.html")
 print(f"✅ shadow_map.html 저장 완료  (총 {time.time()-t0:,.1f} 초)")
