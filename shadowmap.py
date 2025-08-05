@@ -1,4 +1,3 @@
-# shadow_map_debug.py
 import time, math, datetime, pytz, re, warnings
 import pandas as pd, geopandas as gpd, folium, osmnx as ox
 from shapely.geometry import Point, Polygon, MultiPolygon
@@ -13,7 +12,7 @@ from shapely.affinity import scale, rotate
 
 # ────────────────────────────── 기본 설정 ──────────────────────────────
 tz   = pytz.timezone("Asia/Seoul")
-now  = tz.localize(datetime.datetime(2024, 7, 31, 15, 0, 0))   # 분석 시각
+now  = tz.localize(datetime.datetime(2024, 7, 31, 18, 0, 0))   # 분석 시각
 WIDTH_RATIO_TREE = 7                                         # 나무 그림자 폭 = 높이×1.5
 proj = Transformer.from_crs(4326, 5179, always_xy=True)        # 면적(m²) 계산용
 SHELTER_SCALE = 3                                            # 쉼터 그림자 폭
@@ -115,7 +114,7 @@ buffer_50m_poly = Polygon([
 
 CENTER = CENTER_CNU                         # folium 지도 중심
 
-WIDTH_RATIO_TREE = 3.0                      # ★ 더 넓게
+WIDTH_RATIO_TREE = 3.0                 
 
 # ────────── building_shadow_polygon 재정의 ──────────
 def building_shadow_polygon(poly, h, alt, azi):
@@ -146,7 +145,7 @@ def building_shadow_polygon(poly, h, alt, azi):
     return make_valid(shadow)
 
 
-def geom_area_m2(geom):                        # Polygon·MultiPolygon 모두 OK
+def geom_area_m2(geom):               
     proj_fn = lambda x, y, z=None: proj.transform(x, y)
     return transform(proj_fn, geom).area
 
@@ -183,7 +182,7 @@ for _, r in trees_gdf.iterrows():
     crown_r   = h * 0.25                        # 수관 반경 ≈ 높이 1/4
     alt, azi  = get_altitude(lat, lon, now), get_azimuth(lat, lon, now)
 
-    poly = tree_shadow_ellipse(lat, lon, crown_r, alt, azi)  # ★ 새 함수
+    poly = tree_shadow_ellipse(lat, lon, crown_r, alt, azi)  
     if poly.is_empty: continue
 
     area  = geom_area_m2(poly)
@@ -262,7 +261,7 @@ for _, row in osm.iterrows():
     poly = make_valid(row.geometry)
     if poly.is_empty or poly.intersects(shp_union):     # Shapefile과 겹치면 skip
         continue
-    else:                                # ② OSM 태그 → ③ 기본값
+    else:                                # OSM 태그 → ③ 기본값
         # height 태그가 있으면 그대로 float, 없으면 None
         h_height = to_float_or_none(row.get("height"))
         # building:levels 가 "5;4" 같이 여러 개일 때 최대값만 골라 3m/층 으로 환산
@@ -279,12 +278,10 @@ for _, row in osm.iterrows():
 
     alt, azi = get_altitude(poly.centroid.y, poly.centroid.x, now), get_azimuth(poly.centroid.y, poly.centroid.x, now)
     
-    # 1) 유효한 폴리곤만 남기기
     if (poly.is_empty or poly.intersects(shp_union) or
         not isinstance(poly, (Polygon, MultiPolygon))):
         continue
 
-    # 2) 이제 안전하게 그림자 생성
     s_poly = building_shadow_polygon(poly, h, alt, azi)
     if s_poly.is_empty or not s_poly.is_valid:
         continue
@@ -294,10 +291,9 @@ for _, row in osm.iterrows():
 print(f"    → OSM 그림자 {len(osm_layers):,} 개")
 
 
-# ───────────────────── 3. Folium 시각화 (Pretty 버전) ─────────────────────
+# ───────────────────── 3. Folium 시각화  ─────────────────────
 print("  • Folium 지도 생성 중 …")
 
-# 최종 맵 생성: 타일 + 레이어 토글 한 번만
 m = folium.Map(location=CENTER, zoom_start=15, tiles=None)
 folium.TileLayer("OpenStreetMap", name="Default").add_to(m)
 folium.TileLayer("CartoDB positron", name="Light").add_to(m)
@@ -308,8 +304,8 @@ for poly, tip in shp_layers + osm_layers:
     folium.GeoJson(
         poly.__geo_interface__,
         style_function=lambda x: {
-            "fillColor": "#beaed4",
-            "color": "#7e3ff2",
+            "fillColor": "#28252c",
+            "color": "#463f4f",
             "weight": 0.5,
             "fillOpacity": 0.5
         },
@@ -339,14 +335,12 @@ m.add_child(tree_fg)
 # 3-C. 쉼터 그림자 레이어 (주황)
 shelter_fg = folium.FeatureGroup(name="⛱️ 쉼터 그림자", show=True)
 for _, r in shel_gdf.iterrows():
-    # geometry.x/y 에 실제 (경도, 위도)가 들어 있으므로 이걸 바로 꺼냅니다
     lon = r.geometry.x
     lat = r.geometry.y
 
     shelter_h = to_float_or_none(r.get("전체높이")) or 2.5
     canopy_d  = to_float_or_none(r.get("펼침지름")) or 2.0
 
-    # 위도(lat), 경도(lon)를 올바르게 넘겨 줍니다
     alt = get_altitude(lat, lon, now)
     azi = get_azimuth(lat, lon, now)
     poly = shelter_shadow_octagon(lat, lon, canopy_d, shelter_h, alt, azi)
@@ -374,5 +368,5 @@ m.add_child(shelter_fg)
 folium.LayerControl(collapsed=False).add_to(m)
  
 # 결과 저장
-m.save("shadow_map_pretty.html")
-print("✅ shadow_map_pretty.html 저장 완료")
+m.save("shadow_map_pretty_18.html")
+print("shadow_map_pretty_18.html 저장 완료")
