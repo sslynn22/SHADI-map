@@ -1,10 +1,13 @@
 # SHADI-map
 
-
-# 환경 설정
+# Conda 환경 생성 및 활성화
 ``` py
-conda create -n shadi-shadowmap python=3.10           #파이썬 환경 설정
-conda activate shadi-shadowmap                        # 환경 활성화
-conda install -c conda-forge geopandas folium shapely # 지도/공간 데이터 관련 라이브러리 설치
-pip install pysolar                                   # pysolar 모듈 설치
+# 1) Python 3.9 버전 환경 생성
+conda create -n shadow_map python=3.9 -y
+
+# 2) 환경 활성화
+conda activate shadow_map
+
+# 3) 의존 패키지 설치
+conda install -c conda-forge pandas geopandas folium osmnx shapely pyproj numpy pytz pysolar rtree fiona cairo matplotlib -y
 ```
