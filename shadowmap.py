@@ -103,7 +103,8 @@ def shelter_shadow_octagon(lat, lon, diameter_m, height_m, alt, azi):
 
 
 # ────────── 0. 충남대 50 m 버퍼 ──────────
-CENTER_CNU = (36.36917, 127.34515)          # 충남대 정문 좌표 (대략)
+# CENTER_CNU = (36.36917, 127.34515)          # 충남대 정문 좌표 (대략)
+CENTER_CNU = (36.386793, 127.406985) # 쓰레기 집하·전환 시설
 DIST_M     = 1000                            
 deg = DIST_M / 111_320                      # 위도 1° ≈ 111,320 m
 buffer_50m_poly = Polygon([
@@ -308,14 +309,13 @@ for poly, tip in shp_layers + osm_layers:
     folium.GeoJson(
         poly.__geo_interface__,
         style_function=lambda x: {
-            "fillColor": "#beaed4",
-            "color": "#7e3ff2",
+            "fillColor": "#28252c",
+            "color": "#463f4f",
             "weight": 0.5,
             "fillOpacity": 0.5
         },
         tooltip=tip
     ).add_to(bld_fg)
-m.add_child(bld_fg)
 
 # 3-B. 나무 그림자 레이어 (연녹색)
 tree_fg = folium.FeatureGroup(name="🌳 나무 그림자", show=True)
@@ -330,8 +330,8 @@ for _, r in trees_gdf.iterrows():
         style_function=lambda _: {
             "fillColor": "#7fc97f",
             "color": "#4daf4a",
-            "weight": 0.3,
-            "fillOpacity": 0.6
+            "weight": 0.5,
+            "fillOpacity": 0.5
         }
     ).add_to(tree_fg)
 m.add_child(tree_fg)
@@ -364,15 +364,95 @@ for _, r in shel_gdf.iterrows():
         tooltip=f"쉼터 그림자<br>높이≈{shelter_h} m / 지름≈{canopy_d} m"
     ).add_to(shelter_fg)
 
+# ─────────────────── 3-D. OSM 혐오시설 레이어 (빨강) ───────────────────
+print("  • OSM 혐오시설 로드 중 …")
+bad_tags = {
+    "landuse": ["landfill"],
+    "amenity": [
+        "waste_transfer_station",
+        "waste_disposal",
+        "incinerator",
+        "crematorium",
+        "recycling"
+    ],
+    "man_made": ["wastewater_plant", "composting_plant"]
+}
+
+def fetch_bad_features(poly, center, dist_m, tags):
+    """poly에서 먼저 찾고 없으면 center+radius로 폴백."""
+    try:
+        gdf = ox.features_from_polygon(poly, tags=tags)
+        print(f"    → polygon hit: {len(gdf):,} 개")
+    except ox._errors.InsufficientResponseError:
+        print("    → polygon 결과 없음 → point/radius 폴백 시도 …")
+        try:
+            gdf = ox.features_from_point(center, dist=dist_m*3, tags=tags)  # 반경 3배로 확장
+            print(f"    → point/radius hit: {len(gdf):,} 개")
+        except ox._errors.InsufficientResponseError:
+            gdf = gpd.GeoDataFrame({"geometry": []}, crs="EPSG:4326")
+            print("    → 여전히 결과 없음")
+            return gdf
+
+    # 좌표계 정리
+    if getattr(gdf, "crs", None) is None:
+        gdf.set_crs(epsg=4326, inplace=True)
+    else:
+        gdf = gdf.to_crs(epsg=4326)
+    return gdf
+
+bad_osm = fetch_bad_features(buffer_50m_poly, CENTER_CNU, DIST_M, bad_tags)
+
+if not bad_osm.empty:
+    bad_fg = folium.FeatureGroup(name="🚮 혐오시설", show=True)
+    for _, row in bad_osm.iterrows():
+        geom = make_valid(row.geometry)
+        if geom.is_empty:
+            continue
+        tooltip = "<br>".join(
+            f"{k} = {v}" for k, v in row.items()
+            if k in bad_tags and isinstance(v, str)
+        )
+        folium.GeoJson(
+            geom.__geo_interface__,
+            style_function=lambda _: {
+                "fillColor": "#ff6961",
+                "color":      "#c23b22",
+                "weight":     0.5,
+                "fillOpacity":0.5
+            },
+            tooltip=tooltip or "혐오시설"
+        ).add_to(bad_fg)
+    m.add_child(bad_fg)
+else:
+    print("    → 혐오시설 결과가 없어 레이어 생성을 건너뜁니다.")
+
 
 # ─────────────────────────────────────────────────────────────────────
-# 생성해둔 FeatureGroup을 최종 맵에 붙이기
-m.add_child(bld_fg)
+# ─────────────────────────────────────────────────────────────────────
+# 생성해둔 FeatureGroup을 최종 맵에 붙이기 (순서: 나무 → 쉼터 → 혐오시설 → 건물)
 m.add_child(tree_fg)
 m.add_child(shelter_fg)
+if 'bad_fg' in locals():
+    m.add_child(bad_fg)
+m.add_child(bld_fg)  # ← 건물을 맨 마지막에 올려서 다른 레이어 위에 보이게
+
+# 보기 영역 자동 맞춤: 그림자/혐오시설이 있는 구역으로 줌
+try:
+    candidates = []
+    if shp_layers or osm_layers:
+        candidates += [g for g, _ in (shp_layers + osm_layers)]
+    if 'bad_osm' in locals() and not bad_osm.empty:
+        candidates += list(bad_osm.geometry.values)
+
+    if candidates:
+        tb = gpd.GeoSeries(candidates, crs="EPSG:4326").total_bounds  # (minx, miny, maxx, maxy)
+        m.fit_bounds([[tb[1], tb[0]], [tb[3], tb[2]]])
+    else:
+        # 후보가 없으면 기존 CENTER 사용
+        pass
+except Exception as e:
+    print(f"(참고) 자동 줌 실패: {e}")
 
 folium.LayerControl(collapsed=False).add_to(m)
- 
-# 결과 저장
 m.save("shadow_map_pretty.html")
 print("✅ shadow_map_pretty.html 저장 완료")
