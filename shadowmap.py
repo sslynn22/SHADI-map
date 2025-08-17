@@ -20,6 +20,8 @@ SHELTER_SCALE = 3                                            # 쉼터 그림자 
 warnings.filterwarnings("ignore", message="I don't know about leap seconds")
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="shapely")
 
+SHELTER_CSV = "data/대전광역시 유성구_그늘막쉼터_20240920.csv"
+
 # ────────────────────────────── 유틸 함수 ──────────────────────────────
 def shadow_len(h, alt):                        # 그림자 길이(m)
     return 0 if alt <= 0 else h / math.tan(math.radians(alt))
@@ -69,8 +71,66 @@ def tree_shadow_ellipse(lat, lon, r_m, alt, azi):
     shadow = transform(lambda x, y, z=None: to4326.transform(x, y), ellip)
     return make_valid(shadow)
 
-def shelter_shadow_octagon(lat, lon, diameter_m, height_m, alt, azi):
+def tree_shadow_circle(lat, lon, radius_m=3.0):
+    """수관폭 6m(반지름 3m) 등 고정 반경으로 원형 그림자 생성"""
+    to5179 = Transformer.from_crs(4326, 5179, always_xy=True)
+    to4326 = Transformer.from_crs(5179, 4326, always_xy=True)
+    x0, y0 = to5179.transform(lon, lat)
+    circle = Point(x0, y0).buffer(radius_m)               # meters in EPSG:5179
+    shadow = transform(lambda x, y, z=None: to4326.transform(x, y), circle)
+    return make_valid(shadow)
+
+def tree_shadow_dynamic(lat, lon, crown_d_m=6.0, height_m=10.0, alt=None, azi=None, when=None):
+    """
+    시간별 태양 고도/방위각을 반영해 수관 원(지름 crown_d_m)을
+    태양 방향으로 (기본지름 + L) 길이의 타원으로 변환한 그림자 Polygon.
+    L은 나무 높이 height_m로 계산.
+    """
+    # 고도/방위각 확보
+    if alt is None or azi is None:
+        if when is None:
+            raise ValueError("alt/azi 또는 when(분석 시각)을 제공해야 합니다.")
+        alt = get_altitude(lat, lon, when)
+        azi = get_azimuth(lat, lon, when)
+
     if alt <= 0:
+        return Polygon()  # 해 지면 그림자 없음
+
+    # 좌표계를 미터 단위(5179)로
+    to5179 = Transformer.from_crs(4326, 5179, always_xy=True)
+    to4326 = Transformer.from_crs(5179, 4326, always_xy=True)
+    x0, y0 = to5179.transform(lon, lat)
+
+    r = crown_d_m / 2.0
+    base_circle = Point(x0, y0).buffer(r)
+
+    # 나무 높이로 그림자 길이 산정
+    L = shadow_len(height_m, alt)  # = height / tan(alt)
+
+    # 길이 (기본지름 + L) 이 되도록 한 축만 스케일
+    # 기본 타원 장축 = 2*r*scale_y  →  2*r*scale_y = 2*r + L
+    scale_y = (2*r + L) / (2*r)
+
+    ellip = scale(base_circle, 1.0, scale_y, origin=(x0, y0))
+
+    # 태양과 직각이 되도록 회전(그림자 장축이 태양방향을 가리키게)
+    ellip = rotate(ellip, (azi + 90) % 360, origin=(x0, y0))
+
+    # 줄기와 그림자 앞머리가 맞도록 L/2 만큼 태양방향으로 평행이동
+    dx = (L/2.0) * math.sin(math.radians(azi))
+    dy = (L/2.0) * math.cos(math.radians(azi))
+    ellip = translate(ellip, xoff=dx, yoff=dy)
+
+    # WGS84로 복귀
+    shadow = transform(lambda x, y, z=None: to4326.transform(x, y), ellip)
+    return make_valid(shadow)
+
+
+
+def shelter_shadow_octagon(lat, lon, diameter_m, height_m, alt, azi):
+    if alt <= 0 or diameter_m is None or height_m is None:
+        return Polygon()
+    if diameter_m <= 0 or height_m <= 0:
         return Polygon()
 
     # 반지름
@@ -103,6 +163,7 @@ def shelter_shadow_octagon(lat, lon, diameter_m, height_m, alt, azi):
 
 # ────────── 0. 충남대 50 m 버퍼 ──────────
 CENTER_CNU = (36.36917, 127.34515)          # 충남대 정문 좌표 (대략)
+# CENTER_CNU = (36.386793, 127.406985) # 쓰레기 집하·전환 시설
 DIST_M     = 1000                            
 deg = DIST_M / 111_320                      # 위도 1° ≈ 111,320 m
 buffer_50m_poly = Polygon([
@@ -112,9 +173,7 @@ buffer_50m_poly = Polygon([
     (CENTER_CNU[1]-deg, CENTER_CNU[0]+deg)
 ])
 
-CENTER = CENTER_CNU                         # folium 지도 중심
-
-WIDTH_RATIO_TREE = 3.0                 
+CENTER = CENTER_CNU                         # folium 지도 중심          
 
 # ────────── building_shadow_polygon 재정의 ──────────
 def building_shadow_polygon(poly, h, alt, azi):
@@ -154,6 +213,16 @@ def to_float_or_none(val):
     num = re.sub(r"[^0-9.]", "", str(val))
     return float(num) if num else None
 
+def fix_lonlat(df, lat_col="위도", lon_col="경도"):
+    df = df.copy()
+    df[lat_col] = pd.to_numeric(df[lat_col], errors="coerce")
+    df[lon_col] = pd.to_numeric(df[lon_col], errors="coerce")
+    # 한국 대략 범위: 위도 33~39, 경도 124~132
+    lat_looks_like_lon = df[lat_col].between(124, 132).mean()
+    lon_looks_like_lat = df[lon_col].between(33, 39).mean()
+    if lat_looks_like_lon > 0.5 and lon_looks_like_lat > 0.5:
+        df[[lat_col, lon_col]] = df[[lon_col, lat_col]]
+    return df
 
 # ────────────────────────────── 시작 로그 ──────────────────────────────
 t0 = time.time()
@@ -177,31 +246,82 @@ print(f"    → 가로수 {len(trees_gdf):,} 개 (유성구)")
 
 tree_layers = []
 for _, r in trees_gdf.iterrows():
-    lat, lon  = r["위도"], r["경도"]
-    h         = float(r.get("수고", 4))          # 수고 없으면 4 m
-    crown_r   = h * 0.25                        # 수관 반경 ≈ 높이 1/4
-    alt, azi  = get_altitude(lat, lon, now), get_azimuth(lat, lon, now)
+    lat, lon = r["위도"], r["경도"]
 
-    poly = tree_shadow_ellipse(lat, lon, crown_r, alt, azi)  
-    if poly.is_empty: continue
+    poly = tree_shadow_dynamic(
+    lat, lon,
+    crown_d_m=6.0, height_m=10.0,
+    when=now
+    ) 
+    if poly.is_empty:
+        continue
 
-    area  = geom_area_m2(poly)
-    tip   = f"Tree shadow<br>H={h:.1f} m / crown≈{crown_r:.1f} m<br>{area:,.1f} ㎡"
+    area = geom_area_m2(poly)
+    tip  = f"Tree shadow (원형)<br>H≈10 m / crown≈6 m<br>{area:,.1f} ㎡"
     tree_layers.append((poly, tip))
 print(f"    → 그림자 폴리곤 {len(tree_layers):,} 개 생성")
 
 # ───────────────────── 1-B. 그늘막 쉼터 CSV → 그림자 ─────────────────────
 print("  • 그늘막 쉼터 CSV 로드 중 …")
-shel = pd.read_csv("data/대전광역시 유성구_그늘막쉼터_20240920.csv", encoding="euc-kr")
+shel = pd.read_csv(SHELTER_CSV, encoding="euc-kr")
+shel_clean = (fix_lonlat(shel, "위도", "경도")
+              .dropna(subset=["위도","경도"])
+              .reset_index(drop=True))
 
 shel_gdf = gpd.GeoDataFrame(
-    shel.dropna(subset=["위도", "경도"]),
-    geometry=[Point(xy) for xy in zip(shel["위도"], shel["경도"])],
+    shel_clean,
+    geometry=gpd.points_from_xy(shel_clean["경도"], shel_clean["위도"]), # x=경도, y=위도
     crs="EPSG:4326"
 )
-shel_gdf = gpd.clip(shel_gdf, buffer_50m_poly)   # 버퍼 범위로 자르기
-print(f"    → 쉼터 {len(shel_gdf):,} 개 (버퍼 범위)")
 
+shel_gdf = gpd.clip(shel_gdf, buffer_50m_poly)
+print(f"    → 그늘막 쉼터 {len(shel_gdf):,} 개 (버퍼 범위)")
+
+
+# ───────────────────── 1-C. 무더위 쉼터 CSV → 그림자 ─────────────────────
+
+# 3-D. 무더위쉼터 레이어 (보라 + 아이콘)
+print("  • 무더위쉼터 CSV 로드 중 …")
+heat_csv = "data/유성구_무더위쉼터_20250817.csv"
+
+# 인코딩 유연 처리
+try:
+    heat = pd.read_csv(heat_csv, encoding="utf-8-sig")
+except UnicodeDecodeError:
+    heat = pd.read_csv(heat_csv, encoding="cp949")
+
+# 필수 좌표 결측 제거
+heat = heat.dropna(subset=["위도", "경도"])
+
+# ⚠️ 좌표는 (경도, 위도) 순서로 Point 생성해야 지도에 올바르게 찍힘
+heat_gdf = gpd.GeoDataFrame(
+    heat,
+    geometry=[Point(xy) for xy in zip(heat["경도"], heat["위도"])],
+    crs="EPSG:4326"
+)
+
+# 유성구 경계 내만 사용하고 싶으면 아래 한 줄 활성화 (원하면 유지, 아니면 주석)
+heat_gdf = gpd.clip(heat_gdf, admin_poly)
+
+print(f"    → 무더위쉼터 {len(heat_gdf):,} 개")
+
+# 아이콘 마커 레이어
+heat_fg = folium.FeatureGroup(name="🥵 무더위쉼터", show=True)
+for _, r in heat_gdf.iterrows():
+    name  = str(r.get("시설명", "무더위쉼터")).strip()
+    addr  = str(r.get("도로명 주소", "")).strip()
+    hours = str(r.get("운영 시간", "")).strip()
+    lat, lon = float(r["위도"]), float(r["경도"])
+
+    folium.Marker(
+        location=[lat, lon],
+        tooltip=name,  # 짧고 가벼운 툴팁
+        popup=folium.Popup(
+            f"<b>{name}</b><br>{addr}<br>운영 시간: {hours}",
+            max_width=300
+        ),
+        icon=folium.Icon(color="orange", icon="sun", prefix="fa")
+    ).add_to(heat_fg)
 
 # ─────────────────── 2-A. Shapefile 건물 → 보라색 그림자 ───────────────────
 print("  • Shapefile 건물 로드 중 …")
@@ -228,16 +348,15 @@ shp_union = unary_union([g for g, _ in shp_layers])
 
 shel_layers = []
 for _, r in shel_gdf.iterrows():
-    lat, lon = r["위도"], r["경도"]
+    lat, lon = float(r["위도"]), float(r["경도"])
+    shelter_h = to_float_or_none(r.get("전체높이"))
+    canopy_d  = to_float_or_none(r.get("펼침지름"))
 
-    # CSV에 있는 실제 값을 읽어와서 사용
-    shelter_h = to_float_or_none(r.get("전체높이"))    # 전체높이(m)
-    canopy_d  = to_float_or_none(r.get("펼침지름"))     # 펼침지름(m)
-    if shelter_h is None: shelter_h = 3.0
-    if canopy_d  is None: canopy_d  = 3.0
+    # None, 0, 음수 모두 기본값으로 보정
+    if not shelter_h or shelter_h <= 0: shelter_h = 2.5
+    if not canopy_d  or canopy_d  <= 0: canopy_d  = 2.0
 
-    alt, azi = get_altitude(lat, lon, now), get_azimuth(lat, lon, now)
-    # diameter_m=canopy_d, height_m=shelter_h 순으로 인자 전달
+    alt, azi  = get_altitude(lat, lon, now), get_azimuth(lat, lon, now)
     poly = shelter_shadow_octagon(lat, lon, canopy_d, shelter_h, alt, azi)
 
     if poly.is_empty: continue
@@ -245,7 +364,7 @@ for _, r in shel_gdf.iterrows():
     area = geom_area_m2(poly)
     tip  = (f"쉼터 팔각 그림자<br>지름≈{canopy_d:.1f} m<br>{area:,.1f} ㎡")
     shel_layers.append((poly, tip))
-    print(f"    → 쉼터 그림자 폴리곤 {len(tree_layers):,} 개 생성")
+print(f"    → 쉼터 그림자 폴리곤 {len(shel_layers):,} 개 생성")
 
 # ─────────────────── 2-B. OSM 건물 → 빨간색 그림자 ───────────────────
 print("  • OSM 건물 로드 중 …")
@@ -291,82 +410,133 @@ for _, row in osm.iterrows():
 print(f"    → OSM 그림자 {len(osm_layers):,} 개")
 
 
-# ───────────────────── 3. Folium 시각화  ─────────────────────
+# ───────────────────── 3. Folium 시각화 (토글 완비) ─────────────────────
 print("  • Folium 지도 생성 중 …")
 
+# 1) 맵은 '딱 한 번' 생성하고, 기본/라이트 타일을 먼저 등록
 m = folium.Map(location=CENTER, zoom_start=15, tiles=None)
-folium.TileLayer("OpenStreetMap", name="Default").add_to(m)
-folium.TileLayer("CartoDB positron", name="Light").add_to(m)
+folium.TileLayer("OpenStreetMap",       name="기본 지도").add_to(m)
+folium.TileLayer("CartoDB positron",    name="밝은 지도").add_to(m)
+# 필요하면 다크 테마도 추가 가능:
+# folium.TileLayer("CartoDB dark_matter", name="다크 지도").add_to(m)
 
-# 3-A. 건물 그림자 레이어 (보라)
+# 2) 오버레이 레이어들을 FeatureGroup으로 만들어 채운다
+# 2-1) 건물 그림자
 bld_fg = folium.FeatureGroup(name="🏢 건물 그림자", show=False)
-for poly, tip in shp_layers + osm_layers:
+for poly, tip in (shp_layers + osm_layers):
     folium.GeoJson(
         poly.__geo_interface__,
-        style_function=lambda x: {
-            "fillColor": "#28252c",
-            "color": "#463f4f",
-            "weight": 0.5,
-            "fillOpacity": 0.5
+        style_function=lambda _:{
+            "fillColor":"#28252c","color":"#463f4f",
+            "weight":0.5,"fillOpacity":0.5
         },
         tooltip=tip
     ).add_to(bld_fg)
 m.add_child(bld_fg)
 
-# 3-B. 나무 그림자 레이어 (연녹색)
-tree_fg = folium.FeatureGroup(name="🌳 나무 그림자", show=True)
+# 2-2) 가로수 그림자 (6m 수관, 10m 고정 가정이면 그대로)
+tree_fg = folium.FeatureGroup(name="🌳 가로수 그림자", show=True)
 for _, r in trees_gdf.iterrows():
-    lat, lon = r["위도"], r["경도"]
-    # 고정 높이 10m, 수관폭 6m 적용
-    alt, azi = get_altitude(lat, lon, now), get_azimuth(lat, lon, now)
-    poly = tree_shadow_ellipse(lat, lon, 6/2, alt, azi)
-    if poly.is_empty: continue
+    lat, lon = float(r["위도"]), float(r["경도"])
+
+    poly = tree_shadow_dynamic(
+    lat, lon,
+    crown_d_m=6.0, height_m=10.0,
+    when=now
+    )
+    if poly.is_empty:
+        continue
+
     folium.GeoJson(
         poly.__geo_interface__,
-        style_function=lambda _: {
-            "fillColor": "#7fc97f",
-            "color": "#4daf4a",
-            "weight": 0.3,
-            "fillOpacity": 0.6
+        style_function=lambda _:{
+            "fillColor":"#7fc97f","color":"#4daf4a",
+            "weight":0.5,"fillOpacity":0.5
         }
     ).add_to(tree_fg)
 m.add_child(tree_fg)
 
-# 3-C. 쉼터 그림자 레이어 (주황)
-shelter_fg = folium.FeatureGroup(name="⛱️ 쉼터 그림자", show=True)
+
+# 2-3) 그늘막 쉼터 그림자
+shelter_fg = folium.FeatureGroup(name="⛱️ 그늘막 쉼터 그림자", show=True)
 for _, r in shel_gdf.iterrows():
+    lat = r.geometry.y  # ← 항상 geometry에서 읽어 안전
     lon = r.geometry.x
-    lat = r.geometry.y
+    shelter_h = to_float_or_none(r.get("전체높이"))
+    canopy_d  = to_float_or_none(r.get("펼침지름"))
+    if not shelter_h or shelter_h <= 0: shelter_h = 2.5
+    if not canopy_d  or canopy_d  <= 0: canopy_d  = 2.0
 
-    shelter_h = to_float_or_none(r.get("전체높이")) or 2.5
-    canopy_d  = to_float_or_none(r.get("펼침지름")) or 2.0
-
-    alt = get_altitude(lat, lon, now)
-    azi = get_azimuth(lat, lon, now)
+    alt, azi = get_altitude(lat, lon, now), get_azimuth(lat, lon, now)
     poly = shelter_shadow_octagon(lat, lon, canopy_d, shelter_h, alt, azi)
     if poly.is_empty:
         continue
 
     folium.GeoJson(
         poly.__geo_interface__,
-        style_function=lambda _: {
-            "fillColor": "#fdae61",
-            "color": "#e66101",
-            "weight": 0.3,
-            "fillOpacity": 0.6
-        },
-        tooltip=f"쉼터 그림자<br>높이≈{shelter_h} m / 지름≈{canopy_d} m"
+        style_function=lambda _:{ "fillColor":"#fdae61","color":"#e66101",
+                                  "weight":0.3,"fillOpacity":0.6 },
+        tooltip=f"그늘막 쉼터 그림자<br>높이≈{shelter_h} m / 지름≈{canopy_d} m"
     ).add_to(shelter_fg)
-
-
-# ─────────────────────────────────────────────────────────────────────
-# 생성해둔 FeatureGroup을 최종 맵에 붙이기
-m.add_child(bld_fg)
-m.add_child(tree_fg)
 m.add_child(shelter_fg)
 
-folium.LayerControl(collapsed=False).add_to(m)
- 
-# 결과 저장
-m.save("shadow_map_pretty_18.html")
-print("shadow_map_pretty_18.html 저장 완료")
+# 2-4) 혐오시설
+bad_fg = folium.FeatureGroup(name="🚮 혐오시설", show=False)
+
+# bad_osm이 없다면 '빈 GeoDataFrame'으로 초기화해 NameError 방지
+if 'bad_osm' not in locals():
+    bad_osm = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+# 데이터가 있을 때만 실제 피처를 채움
+if not bad_osm.empty:
+    for _, row in bad_osm.iterrows():
+        geom = make_valid(row.geometry)
+        if geom.is_empty:
+            continue
+        folium.GeoJson(
+            geom.__geo_interface__,
+            style_function=lambda _:{ "fillColor":"#ff6961","color":"#c23b22",
+                                      "weight":0.5,"fillOpacity":0.5 },
+            tooltip="<br>".join([f"{k}={row.get(k)}" for k in
+                                 ["name","amenity","landuse","man_made","industrial","waste"]
+                                 if row.get(k)])
+        ).add_to(bad_fg)
+m.add_child(bad_fg)
+
+
+# 2-5) 무더위쉼터 
+heat_fg = folium.FeatureGroup(name="🥵 무더위쉼터", show=True)
+for _, r in heat_gdf.iterrows():
+    name  = str(r.get("시설명","무더위쉼터")).strip()
+    addr  = str(r.get("도로명 주소","")).strip()
+    hours = str(r.get("운영 시간","")).strip()
+    lat, lon = float(r["위도"]), float(r["경도"])
+    folium.Marker(
+        location=[lat, lon],
+        tooltip=name,
+        popup=folium.Popup(f"<b>{name}</b><br>{addr}<br>운영 시간: {hours}", max_width=320),
+        icon=folium.Icon(color="orange", icon="sun", prefix="fa")
+    ).add_to(heat_fg)
+m.add_child(heat_fg)
+
+# 3) (선택) 데이터가 있으면 자동으로 보기 영역 맞추기
+try:
+    candidates = []
+    if shp_layers or osm_layers:
+        candidates += [g for g,_ in (shp_layers + osm_layers)]
+    if 'bad_osm' in locals() and not bad_osm.empty:
+        candidates += list(bad_osm.geometry.values)
+    if len(heat_gdf) > 0:
+        candidates += list(heat_gdf.geometry.values)
+    if candidates:
+        tb = gpd.GeoSeries(candidates, crs="EPSG:4326").total_bounds
+        m.fit_bounds([[tb[1], tb[0]],[tb[3], tb[2]]])
+except Exception as e:
+    print(f"(참고) 자동 줌 실패: {e}")
+
+# 4) 마지막에 딱 한 번 LayerControl 추가 (여기서 해야 토글에 전부 보임)
+folium.LayerControl(collapsed=False, position="topleft").add_to(m)
+
+# 5) 저장
+m.save("shadow_map_pretty.html")
+print("shadow_map_pretty.html 저장 완료")
