@@ -58,13 +58,18 @@ def tree_shadow_ellipse(lat, lon, r_m, alt, azi):
     stretch = 1 / math.tan(math.radians(alt))     # 고도 낮을수록 길어짐
     ellip   = scale(circle, 1, stretch, origin=(x0, y0))
 
-    # ─ 3) 태양과 직각이 되도록 회전 =-0987654321
-    ellip   = rotate(ellip, (azi + 90) % 360, origin=(x0, y0))
+    # ─ 3) 그림자 방향 
+    b = (azi + 180) % 360
+
+    # 타원의 장축을 '그림자 방향'으로 정렬 (Shapely는 수학각도, CCW 기준 → 음수 회전)
+    ellip = rotate(ellip, -b, origin=(x0, y0))
+
+    # 트렁크와 앞머리 맞추기: L/2만큼 '그림자 방향'으로 평행이동
+    dx = (L/2.0) * math.sin(math.radians(b))
+    dy = (L/2.0) * math.cos(math.radians(b))
 
     # ─ 4) 트렁크와 타원 앞머리가 맞게 L/2 만큼 뒤로 이동 ─
     L   = shadow_len(r_m, alt)                   # 캐노피 기준 그림자 길이
-    dx  =  (L/2) * math.sin(math.radians(azi))
-    dy  =  (L/2) * math.cos(math.radians(azi))
     ellip = translate(ellip, xoff=dx, yoff=dy)
 
     # ─ 5) EPSG:4326 로 환원 ─
@@ -147,10 +152,11 @@ def shelter_shadow_octagon(lat, lon, diameter_m, height_m, alt, azi):
     shadow = scale(base, 1, stretch, origin=(0, 0))
 
     # 4) 태양과 직각으로 회전
-    shadow = rotate(shadow, (azi + 90) % 360, origin=(0, 0))
-
+    b = (azi + 180) % 360  # 그림자 방향
+    shadow = rotate(shadow, -b, origin=(0, 0))
+    
     # 5) 기둥(쉼터)과 그림자 이어붙이기 (반만 평행이동)
-    dx, dy = (L/2)*math.sin(math.radians(azi)), (L/2)*math.cos(math.radians(azi))
+    dx, dy = (L/2)*math.sin(math.radians(b)), (L/2)*math.cos(math.radians(b))
     shadow = translate(shadow, xoff=dx, yoff=dy)
 
     # 6) WGS84 좌표로 이동
@@ -181,9 +187,10 @@ def building_shadow_polygon(poly, h, alt, azi):
         return Polygon()
 
     L  = shadow_len(h, alt)
-    dy =  L*math.cos(math.radians(azi)) / 111_320
-    dx = (L*math.sin(math.radians(azi))
-          / (40075_000*math.cos(math.radians(poly.centroid.y))/360))
+    b  = (azi + 180) % 360  # 그림자 방향
+    dy =  L*math.cos(math.radians(b)) / 111_320
+    dx = (L*math.sin(math.radians(b))
+        / (40075_000*math.cos(math.radians(poly.centroid.y))/360))
 
     def _shadow(p):
         src  = list(p.exterior.coords)
