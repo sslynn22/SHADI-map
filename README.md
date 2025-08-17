@@ -1,5 +1,5 @@
 # SHADI-map
-
+![alt text](image/image.png)
 
 # Conda 환경 생성 및 활성화
 ``` py
