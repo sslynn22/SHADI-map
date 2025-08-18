@@ -476,6 +476,7 @@ SELECT ST_AsGeoJSON(ST_Transform(ST_Collect(g5179),4326)) AS gj, COUNT(*) AS cnt
         cnt = int(row["cnt"]) if row and row["cnt"] is not None else 0
         return {"gj": gj, "count": cnt, "table": table}
 
+
 MAP_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -495,7 +496,7 @@ MAP_HTML = r"""<!doctype html>
     #panel .row{display:flex; gap:6px; margin-top:4px; align-items:center}
     #panel input[type=text], #panel input[type=datetime-local] { width:100%; padding:6px 8px; margin:4px 0 8px; border:1px solid #ccc; border-radius:8px; }
     #panel button{flex:1; padding:8px; border:0; border-radius:8px; cursor:pointer}
-    #panel .btn{background:#225ea8; color:#fff}
+    #panel .btn{background:#1BA952; color:#fff}
     #panel .ghost{background:#f1f3f5; color:#222}
     #shadow-stats {font-size:12px; color:#333; margin-top:6px; line-height:1.4}
     .chip{display:inline-block; width:12px; height:12px; border-radius:3px; margin-right:6px; vertical-align:middle}
@@ -524,9 +525,9 @@ MAP_HTML = r"""<!doctype html>
     .route-time .unit{ font-size:13px; font-weight:600; color:#444; margin-left:2px; }
 
     .route-main { display:flex; flex-direction:column; gap:4px; flex:1; min-width:0; }
-    .title-coolest  { font-weight:800; color:#225ea8; font-size:14px; }
-    .title-shortest { font-weight:800; color:#225ea8; font-size:14px; }
-    .title-shelter  { font-weight:800; color:#8e44ad; font-size:14px; } /* [ADD] 쉼터우선 색상 */
+    .title-coolest  { font-weight:800; color:#46e583; font-size:14px; }
+    .title-shortest { font-weight:800; color:#1BA952; font-size:14px; }
+    .title-shelter  { font-weight:800; color:#03491e; font-size:14px; } /* [ADD] 쉼터우선 색상 */
     .route-meta  { display:flex; gap:10px; align-items:center; color:#444; font-size:12px; }
     .route-meta span { white-space:nowrap; }
     .muted { color:#6b7280 }
@@ -535,8 +536,8 @@ MAP_HTML = r"""<!doctype html>
 <body>
 <div id="map"><!-- Chat button & panel -->
 <button id="chat-toggle" style="position:absolute; right:16px; bottom:16px; z-index:1100;
-  border:0; border-radius:999px; padding:12px 16px; background:#225ea8; color:#fff; box-shadow:0 3px 10px rgba(0,0,0,.2);">
-  챗봇
+  border:0; background:none; padding:0; cursor:pointer;">
+  <img src="/static/chatbot.png" alt="챗봇" style="width:120px; height:auto;">
 </button>
 <div id="chat-panel" style="position:absolute; right:16px; bottom:70px; z-index:1100; width:320px;
   background:rgba(255,255,255,.98); border:1px solid #e5e7eb; border-radius:12px; display:none;
@@ -775,15 +776,15 @@ MAP_HTML = r"""<!doctype html>
 
             // 새 선 생성
             if(js.shortest && js.shortest.gj){
-              shortestPolyline = polylineFromGeoJSON(js.shortest.gj, {strokeWeight:6, strokeColor:'#333333', strokeOpacity:0.95});
+              shortestPolyline = polylineFromGeoJSON(js.shortest.gj, {strokeWeight:6, strokeColor:'#1BA952', strokeOpacity:0.95});
               shortestPolyline.setMap(map);
             }
             if(js.coolest && js.coolest.gj){
-              coolestPolyline  = polylineFromGeoJSON(js.coolest.gj, {strokeWeight:6, strokeColor:'#225ea8', strokeOpacity:0.95});
+              coolestPolyline  = polylineFromGeoJSON(js.coolest.gj, {strokeWeight:6, strokeColor:'#46e583', strokeOpacity:0.95});
               coolestPolyline.setMap(map);
             }
             if(js.shelter && js.shelter.gj){
-              shelterPolyline = polylineFromGeoJSON(js.shelter.gj, {strokeWeight:6, strokeColor:'#8e44ad', strokeOpacity:0.95}); // [ADD] 보라
+              shelterPolyline = polylineFromGeoJSON(js.shelter.gj, {strokeWeight:6, strokeColor:'#03491e', strokeOpacity:0.95}); // [ADD] 보라
               shelterPolyline.setMap(map);
             }
 
@@ -824,9 +825,9 @@ MAP_HTML = r"""<!doctype html>
             </div>`;
           items.push(html);
         }
-        build('shelter',  'title-shelter',  '쉼터우선', data.shelter);  // [ADD]
         build('coolest',  'title-coolest',  '시원한길', data.coolest);
         build('shortest', 'title-shortest', '최단거리', data.shortest);
+        build('shelter',  'title-shelter',  '쉼터우선', data.shelter);  // [ADD]
 
         routesEl.innerHTML = items.join('') || '<div class="muted">경로가 없습니다.</div>';
         routesEl.onclick = (e)=>{
@@ -840,23 +841,23 @@ MAP_HTML = r"""<!doctype html>
       function selectRoute(kind){
         selectedKind = kind;
         if(kind === 'shortest'){
-          setLineColor(shortestPolyline, '#225ea8'); // 파랑 강조
-          setLineColor(coolestPolyline,  '#333333');
-          setLineColor(shelterPolyline,  '#8e44ad');
+          setLineColor(shortestPolyline, '#1BA952');
+          setLineColor(coolestPolyline,  '#46e583');
+          setLineColor(shelterPolyline,  '#03491e');
           if(shortestPolyline) shortestPolyline.setMap(map);
           if(coolestPolyline)  coolestPolyline.setMap(null);
           if(shelterPolyline)  shelterPolyline.setMap(null);
         }else if(kind === 'coolest'){
-          setLineColor(coolestPolyline,  '#225ea8');
-          setLineColor(shortestPolyline, '#333333');
-          setLineColor(shelterPolyline,  '#8e44ad');
+          setLineColor(coolestPolyline,  '#46e583');
+          setLineColor(shortestPolyline, '#1BA952');
+          setLineColor(shelterPolyline,  '#03491e');
           if(coolestPolyline)  coolestPolyline.setMap(map);
           if(shortestPolyline) shortestPolyline.setMap(null);
           if(shelterPolyline)  shelterPolyline.setMap(null);
         }else if(kind === 'shelter'){
-          setLineColor(shelterPolyline,  '#8e44ad');
-          setLineColor(shortestPolyline, '#333333');
-          setLineColor(coolestPolyline,  '#225ea8');
+          setLineColor(shelterPolyline,  '#03491e');
+          setLineColor(shortestPolyline, '#1BA952');
+          setLineColor(coolestPolyline,  '#46e583');
           if(shelterPolyline)  shelterPolyline.setMap(map);
           if(shortestPolyline) shortestPolyline.setMap(null);
           if(coolestPolyline)  coolestPolyline.setMap(null);
