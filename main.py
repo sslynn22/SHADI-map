@@ -5,6 +5,7 @@ from flask_cors import CORS
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import csv  # [ADD] 무더위쉼터 CSV 읽기
+from ai_chat.blueprint import make_chat_blueprint
 
 # ── api_keys.env 로부터 환경변수 로드  ──
 ENV_FILE = os.getenv("API_KEYS_ENV_PATH", "api_keys.env")
@@ -23,6 +24,11 @@ def _load_env_file(path: str):
     except FileNotFoundError:
         pass
 _load_env_file(ENV_FILE)
+
+app = Flask(__name__)
+CORS(app)
+app.register_blueprint(make_chat_blueprint(), url_prefix="/chat")  # <-- "/chat" 로 고정
+
 # ───────────────────────────────────────────────────────────────────────
 
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
@@ -470,9 +476,6 @@ SELECT ST_AsGeoJSON(ST_Transform(ST_Collect(g5179),4326)) AS gj, COUNT(*) AS cnt
         cnt = int(row["cnt"]) if row and row["cnt"] is not None else 0
         return {"gj": gj, "count": cnt, "table": table}
 
-app = Flask(__name__)
-CORS(app)
-
 MAP_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -530,7 +533,23 @@ MAP_HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
-<div id="map"></div>
+<div id="map"><!-- Chat button & panel -->
+<button id="chat-toggle" style="position:absolute; right:16px; bottom:16px; z-index:1100;
+  border:0; border-radius:999px; padding:12px 16px; background:#225ea8; color:#fff; box-shadow:0 3px 10px rgba(0,0,0,.2);">
+  챗봇
+</button>
+<div id="chat-panel" style="position:absolute; right:16px; bottom:70px; z-index:1100; width:320px;
+  background:rgba(255,255,255,.98); border:1px solid #e5e7eb; border-radius:12px; display:none;
+  box-shadow:0 8px 24px rgba(0,0,0,.18); overflow:hidden;">
+  <div style="padding:10px; font-weight:700; font-size:14px; border-bottom:1px solid #eee">SHADI 챗봇</div>
+  <div id="chat-log" style="height:260px; overflow:auto; padding:10px; font-size:13px;"></div>
+  <div style="display:flex; gap:6px; padding:10px; border-top:1px solid #eee">
+    <input id="chat-input" type="text" placeholder="예) 출발 36.3617,127.3447 / 도착 36.3721,127.3452"
+           style="flex:1; border:1px solid #ddd; border-radius:8px; padding:8px 10px;">
+    <button id="chat-send" class="ghost" style="padding:8px 10px; border-radius:8px;">보내기</button>
+  </div>
+</div>
+</div>
 
 <!-- 우측 상단 입력 패널 -->
 <div id="panel">
@@ -997,6 +1016,52 @@ MAP_HTML = r"""<!doctype html>
           strokeStyle:  style.strokeStyle  ?? 'solid'
         });
       }
+      // === Chatbot wiring ===
+      const chatBtn = document.getElementById('chat-toggle');
+      const chatBox = document.getElementById('chat-panel');
+      const chatLog = document.getElementById('chat-log');
+      const chatIn  = document.getElementById('chat-input');
+      const chatSend= document.getElementById('chat-send');
+
+      function pushMsg(who, text){
+        const div = document.createElement('div');
+        div.style.margin = '6px 0';
+        div.innerHTML = `<div style="font-weight:700;color:${who==='me'?'#225ea8':'#111'}">${who==='me'?'나':'SHADI'}</div>
+                        <div style="white-space:pre-wrap; line-height:1.35">${text}</div>`;
+        chatLog.appendChild(div);
+        chatLog.scrollTop = chatLog.scrollHeight;
+      }
+
+      async function askChat(t){
+        pushMsg('me', t);
+        chatIn.value = '';
+        const res = await fetch('/chat/ask', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ message: t })
+        });
+        const js = await res.json();
+
+        if(js.type === 'route' && js.src && js.dst){
+          // 지도 입력창/마커에 주입 후 기존 "실행" 로직 그대로 활용
+          setSrcByLatLng(js.src.lat, js.src.lon);
+          setDstByLatLng(js.dst.lat, js.dst.lon);
+          pushMsg('bot', js.text || '좌표를 인식했어요. 경로를 계산합니다.');
+          document.getElementById('run')?.click();
+        }else{
+          pushMsg('bot', js.text || '도움이 필요하신가요? 출발/도착 좌표 두 쌍을 알려주시면 경로를 그려드릴게요.');
+        }
+      }
+
+      chatBtn?.addEventListener('click', ()=> {
+        chatBox.style.display = (chatBox.style.display==='none' || !chatBox.style.display)? 'block':'none';
+        if(chatBox.style.display==='block') chatIn.focus();
+      });
+      chatSend?.addEventListener('click', ()=> { const v=(chatIn.value||'').trim(); if(v) askChat(v); });
+      chatIn?.addEventListener('keydown', (e)=> { if(e.key==='Enter'){ const v=(chatIn.value||'').trim(); if(v) askChat(v); }});
+
+      // 시작 안내 한 줄
+      pushMsg('bot', '안녕하세요! 기능 설명을 물어보거나, 출발/도착 좌표 두 쌍을 주시면 바로 경로를 계산해 드려요.\n예) 출발 36.3617,127.3447 / 도착 36.3721,127.3452');
+
     }); // kakao.maps.load
   });   // DOMContentLoaded
 </script>
