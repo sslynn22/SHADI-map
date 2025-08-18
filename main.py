@@ -7,6 +7,7 @@ from psycopg2.extras import RealDictCursor
 import csv  # [ADD] 무더위쉼터 CSV 읽기
 from ai_chat.blueprint import make_chat_blueprint
 
+
 # ── api_keys.env 로부터 환경변수 로드  ──
 ENV_FILE = os.getenv("API_KEYS_ENV_PATH", "api_keys.env")
 def _load_env_file(path: str):
@@ -539,13 +540,13 @@ MAP_HTML = r"""<!doctype html>
   border:0; background:none; padding:0; cursor:pointer;">
   <img src="/static/chatbot.png" alt="챗봇" style="width:120px; height:auto;">
 </button>
-<div id="chat-panel" style="position:absolute; right:16px; bottom:70px; z-index:1100; width:320px;
+<div id="chat-panel" style="position:absolute; right:16px; bottom:85px; z-index:1100; width:320px;
   background:rgba(255,255,255,.98); border:1px solid #e5e7eb; border-radius:12px; display:none;
   box-shadow:0 8px 24px rgba(0,0,0,.18); overflow:hidden;">
   <div style="padding:10px; font-weight:700; font-size:14px; border-bottom:1px solid #eee">SHADI 챗봇</div>
   <div id="chat-log" style="height:260px; overflow:auto; padding:10px; font-size:13px;"></div>
   <div style="display:flex; gap:6px; padding:10px; border-top:1px solid #eee">
-    <input id="chat-input" type="text" placeholder="예) 출발 36.3617,127.3447 / 도착 36.3721,127.3452"
+    <input id="chat-input" type="text" placeholder="예) 출발 충남대학교 도서관 / 도착 매드블럭"
            style="flex:1; border:1px solid #ddd; border-radius:8px; padding:8px 10px;">
     <button id="chat-send" class="ghost" style="padding:8px 10px; border-radius:8px;">보내기</button>
   </div>
@@ -685,6 +686,7 @@ MAP_HTML = r"""<!doctype html>
       let shortestPolyline=null, coolestPolyline=null, shelterPolyline=null; // [ADD] shelter
       let searchMarkers=[];
       let selectedKind = null;
+      let allowedKinds = ['shortest','coolest','shelter'];
       const shadowBuilding=[], shadowTree=[], shadowShelter=[];
       const places = new kakao.maps.services.Places();
 
@@ -798,6 +800,13 @@ MAP_HTML = r"""<!doctype html>
 
             // 경로 카드 렌더 (쉼터우선 → 시원 → 최단)
             renderRouteCards(js);
+
+            // runBtn.onclick 내부, 폴리라인 생성 직후 아래 줄 추가
+            // ... 폴리라인들 생성(setMap) 이후
+            if(!allowedKinds.includes('shortest') && shortestPolyline){ shortestPolyline.setMap(null); }
+            if(!allowedKinds.includes('coolest')  && coolestPolyline){  coolestPolyline.setMap(null); }
+            if(!allowedKinds.includes('shelter')  && shelterPolyline){  shelterPolyline.setMap(null); }
+
           }catch(e){ alert("오류: "+e.message); }
           finally{ runBtn.disabled=false; runBtn.innerText="실행"; }
         };
@@ -808,6 +817,7 @@ MAP_HTML = r"""<!doctype html>
         const routesEl = $('routes'); if(!routesEl) return;
         const items = [];
         function build(kind, titleClass, titleText, obj){
+          if(!allowedKinds.includes(kind)) return;  // ⬅️ 추가: 허용된 종류만
           if(!obj || !obj.gj || obj.total_m==null) return;
           const m = obj.total_m;
           const min = walkMinutesFromMeters(m);
@@ -825,15 +835,29 @@ MAP_HTML = r"""<!doctype html>
             </div>`;
           items.push(html);
         }
-        build('coolest',  'title-coolest',  '시원한길', data.coolest);
-        build('shortest', 'title-shortest', '최단거리', data.shortest);
-        build('shelter',  'title-shelter',  '쉼터우선', data.shelter);  // [ADD]
+          build('coolest','title-coolest','시원한길', data.coolest);
+          build('shortest','title-shortest','최단거리', data.shortest);
+          build('shelter','title-shelter','쉼터우선', data.shelter);
 
-        routesEl.innerHTML = items.join('') || '<div class="muted">경로가 없습니다.</div>';
-        routesEl.onclick = (e)=>{
-          const card = e.target.closest('.route-card');
-          if(!card) return;
-          selectRoute(card.getAttribute('data-kind'));
+          routesEl.innerHTML = items.join('') || '<div class="muted">경로가 없습니다.</div>';
+
+          // ⬇️ 자동 선택 로직 변경:
+          // - 단일 모드(키워드가 있어 allowedKinds가 1개)일 때만 자동 선택해서 단일 라인만 보이게
+          // - 복수 모드(키워드 없음)라면 자동 선택 안 함 → 지도에 3개 라인 모두 표시 유지
+          if (allowedKinds.length === 1) {
+            const onlyKind = allowedKinds[0];
+            if (data[onlyKind] && data[onlyKind].gj) {
+              selectRoute(onlyKind);
+            }
+         } else {
+           // 복수 모드: 모든 라인을 그대로 보이게 두고, 카드 활성표시는 초기엔 없음
+           routesEl.querySelectorAll('.route-card').forEach(card => card.classList.remove('active'));
+         }
+
+          routesEl.onclick = (e)=>{ 
+            const card = e.target.closest('.route-card');
+            if(!card) return;
+            selectRoute(card.getAttribute('data-kind'));
         };
       }
 
@@ -1027,7 +1051,7 @@ MAP_HTML = r"""<!doctype html>
       function pushMsg(who, text){
         const div = document.createElement('div');
         div.style.margin = '6px 0';
-        div.innerHTML = `<div style="font-weight:700;color:${who==='me'?'#225ea8':'#111'}">${who==='me'?'나':'SHADI'}</div>
+        div.innerHTML = `<div style="font-weight:700;color:${who==='me'?'#225ea8':'#1BA952'}">${who==='me'?'나':'SHADI'}</div>
                         <div style="white-space:pre-wrap; line-height:1.35">${text}</div>`;
         chatLog.appendChild(div);
         chatLog.scrollTop = chatLog.scrollHeight;
@@ -1036,21 +1060,42 @@ MAP_HTML = r"""<!doctype html>
       async function askChat(t){
         pushMsg('me', t);
         chatIn.value = '';
+
         const res = await fetch('/chat/ask', {
-          method:'POST', headers:{'Content-Type':'application/json'},
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
           body: JSON.stringify({ message: t })
         });
+
         const js = await res.json();
 
+        // 1) 경로 요청이면: src/dst 찍고 허용 경로만 표시
         if(js.type === 'route' && js.src && js.dst){
-          // 지도 입력창/마커에 주입 후 기존 "실행" 로직 그대로 활용
           setSrcByLatLng(js.src.lat, js.src.lon);
           setDstByLatLng(js.dst.lat, js.dst.lon);
+
+          // 허용 경로 kinds 적용 (없으면 기본 3종)
+          allowedKinds = Array.isArray(js.modes) && js.modes.length
+            ? js.modes
+            : ['shortest','coolest','shelter'];
+
           pushMsg('bot', js.text || '좌표를 인식했어요. 경로를 계산합니다.');
           document.getElementById('run')?.click();
-        }else{
-          pushMsg('bot', js.text || '도움이 필요하신가요? 출발/도착 좌표 두 쌍을 알려주시면 경로를 그려드릴게요.');
+
+          if(js.prefer){
+            setTimeout(()=>selectRoute(js.prefer), 1500);
+          }
+          return;
         }
+
+        // 2) 일반 안내(지오코딩 실패 등)
+        if(js.type === 'answer' && js.text){
+          pushMsg('bot', js.text);
+          return;
+        }
+
+        // 3) 예외 응답
+        pushMsg('bot', '요청을 처리할 수 없었어요. 좌표 또는 장소명을 다시 보내주세요.');
       }
 
       chatBtn?.addEventListener('click', ()=> {
@@ -1151,6 +1196,8 @@ def hot_shelters():
         except Exception:
             continue
     return jsonify(rows)
+
+
 
 if __name__ == "__main__":
     print(f"Serving on http://{APP_HOST}:{APP_PORT}  (PG_URL={PG_URL})")
