@@ -8,6 +8,9 @@ import csv  # [ADD] 무더위쉼터 CSV 읽기
 from ai_chat.blueprint import make_chat_blueprint
 from typing import Optional, Dict, Any, List, Tuple
 import logging
+from flask import Flask, request, jsonify, render_template_string, send_file 
+from flask import send_from_directory, abort
+
 
 # 로거 기본 설정 (main.py 상단 어딘가에 추가)
 logging.basicConfig(level=logging.DEBUG,
@@ -35,6 +38,20 @@ _load_env_file(ENV_FILE)
 app = Flask(__name__)
 CORS(app)
 app.register_blueprint(make_chat_blueprint(), url_prefix="/chat")  # <-- "/chat" 로 고정
+
+@app.get("/image/chatbot.png")
+def _serve_chatbot_png():
+    # 컨테이너에 있는 파일 경로 (지금 업로드된 위치)
+    return send_file("/mnt/data/chatbot.png", mimetype="image/png")
+
+@app.get("/image/<path:name>")
+def serve_image(name):
+    # 필요한 파일만 허용
+    allow = {"chatbot.png"}
+    if name not in allow:
+        abort(404)
+    # 개발 메시지에 따르면 파일 경로는 /mnt/data/chatbot.png
+    return send_from_directory("/mnt/data", name)
 
 # ───────────────────────────────────────────────────────────────────────
 
@@ -724,9 +741,9 @@ MAP_HTML = r"""<!doctype html>
 <div id="map"><!-- Chat button & panel -->
 <button id="chat-toggle" style="position:absolute; right:16px; bottom:16px; z-index:1100;
   border:0; background:none; padding:0; cursor:pointer;">
-  <img src="/static/chatbot.png" alt="챗봇" style="width:120px; height:auto;">
+  <img src="/static/chatbot.png" alt="챗봇" style="width:200px; height:auto;">
 </button>
-<div id="chat-panel" style="position:absolute; right:16px; bottom:85px; z-index:1100; width:320px;
+<div id="chat-panel" style="position:absolute; right:16px; bottom:125px; z-index:1100; width:320px;
   background:rgba(255,255,255,.98); border:1px solid #e5e7eb; border-radius:12px; display:none;
   box-shadow:0 8px 24px rgba(0,0,0,.18); overflow:hidden;">
   <div style="padding:10px; font-weight:700; font-size:14px; border-bottom:1px solid #eee">SHADI 챗봇</div>
@@ -1041,6 +1058,11 @@ MAP_HTML = r"""<!doctype html>
 
             // 경로 카드 렌더 (쉼터우선 → 시원 → 최단)
             renderRouteCards(js);
+
+            if (window.__preferRoute && window.__preferRoute !== 'all') {
+              selectRoute(window.__preferRoute);  // 'coolest'|'shortest'|'shelter'
+            }
+            window.__preferRoute = null;
           
             // runBtn.onclick 내부, 폴리라인 생성 직후 아래 줄 추가
             // ... 폴리라인들 생성(setMap) 이후
@@ -1422,6 +1444,10 @@ MAP_HTML = r"""<!doctype html>
 
         // 1) 경로 요청이면: src/dst 찍고 허용 경로만 표시
         if(js.type === 'route' && js.src && js.dst){
+
+          // ⬇️ 선호값 저장 (없으면 'all')
+          window.__preferRoute = js.prefer || 'all';
+
           setSrcByLatLng(js.src.lat, js.src.lon);
           setDstByLatLng(js.dst.lat, js.dst.lon);
 
@@ -1457,7 +1483,7 @@ MAP_HTML = r"""<!doctype html>
       chatIn?.addEventListener('keydown', (e)=> { if(e.key==='Enter'){ const v=(chatIn.value||'').trim(); if(v) askChat(v); }});
 
       // 시작 안내 한 줄
-      pushMsg('bot', '안녕하세요! 기능 설명을 물어보거나, 출발/도착 좌표 두 쌍을 주시면 바로 경로를 계산해 드려요.\n예) 출발 36.3617,127.3447 / 도착 36.3721,127.3452');
+      pushMsg('bot', '안녕하세요! 기능 설명을 물어보거나, 출발/도착 좌표 두 쌍을 주시면 바로 경로를 계산해 드려요.\n예) 출발 충남대학교 도서관 / 도착 다솔아파트');
 
     }); // kakao.maps.load
   });   // DOMContentLoaded

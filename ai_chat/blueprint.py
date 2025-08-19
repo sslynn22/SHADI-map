@@ -49,6 +49,11 @@ _PATTERNS = [
     re.compile(r'출발\s*(.+?)\s*도착\s*(.+)$'),
 ]
 
+HELP_KWS = re.compile(
+    r"(기능\s*설명|설명|사용법|사용\s*방법|도움|도움말|헬프|help|what\s+can\s+you\s+do)",
+    re.I)
+COOL_ONLY_KWS = re.compile(r"(시원한\s*(길|경로).*(안내|추천|라우팅)|cool(est)?\s*route)", re.I)
+
 # ----------------------------
 # 데이터 클래스
 # ----------------------------
@@ -232,33 +237,16 @@ def _resolve_two_places(text: str) -> Optional[Tuple[LL, LL]]:
 # OpenAI 안내(토큰 절약)
 # ----------------------------
 def _ai_help(user_text: str) -> str:
-    base_help = (
-        "출발/도착을 장소명으로 입력하면 카카오 지오코딩으로 좌표를 찾고,\n"
-        "그늘(건물/가로수/쉼터) 정보를 이용해 시원한 길을 계산해 드립니다.\n"
-        "예) 출발 충남대 정문 / 도착 유성온천역\n"
-        "예) from 대전역 to KAIST 정문\n"
-        "TIP: '출발 … / 도착 …' 형태가 가장 정확합니다."
+        # 🔒 도움말은 외부 생성 사용 금지 — SHADI 고정 가이드 반환
+    guide = (
+        "첫째, 건물·가로수·그늘막 그림자를 지도에 보여드려요.\n"
+        "둘째, 출발지랑 목적지를 말해주시면, 그늘 많은 길을 찾아드려요.\n"
+        "셋째, 선택한 경로로 길안내를 해드리고요.\n"
+        "마지막으로, 안내가 끝난 뒤 만족도를 물어보고 그 피드백으로 더 똑똑해집니다.\n\n"
+
+        "예를 들어 '출발 충남대 정문 / 도착 유성온천역' 이렇게 말씀하시면 가장 정확해요."
     )
-    if not (_USE_AI and _openai_client and os.getenv("OPENAI_API_KEY")):
-        log.debug("_ai_help: OpenAI 미사용 -> base_help 반환")
-        return base_help
-    try:
-        log.debug("_ai_help: OpenAI 호출")
-        resp = _openai_client.chat.completions.create(
-            model=_openai_model,
-            temperature=0.2,
-            max_tokens=50,
-            messages=[
-                {"role":"system","content":"너는 SHADI 안내 챗봇. 답변은 한국어로, 한두 문장 이내, 50자 이하로만 간결하게."},
-                {"role":"user","content":f"사용자 입력: {user_text}\nSHADI의 핵심 기능을 간단히 안내해줘."}
-            ]
-        )
-        txt = (resp.choices[0].message.content or "").strip()
-        log.debug("_ai_help: OpenAI 응답='%s'", txt)
-        return txt or base_help
-    except Exception as e:
-        log.warning("OpenAI help fallback: %s", e)
-        return base_help
+    return guide
 
 # ----------------------------
 # Flask Blueprint
@@ -269,13 +257,22 @@ def make_chat_blueprint():
 
     @bp.post("/ask")
     def ask():
-        try:
-            data = request.get_json(force=True, silent=True) or {}
-        except Exception as e:
-            log.warning("/ask JSON 파싱 실패: %s", e)
-            return jsonify(error="invalid json"), 400
-
+        data = request.get_json(force=True, silent=True) or {}
         text = str(data.get("message", "")).strip()
+
+        # --- 0) 기능 설명/사용법 요청: 규칙 기반 즉시 응답 (고정 가이드) ---
+        if HELP_KWS.search(text):
+            return jsonify({"type": "answer", "text": _ai_help(text)})
+
+        # --- 0-1) 시원한 경로만 요청인데 좌표/장소가 없는 경우: 사용법 안내 ---
+        if COOL_ONLY_KWS.search(text) and not _extract_two_coords(text) and not _split_start_end(text):
+            return jsonify({"type": "answer",
+                            "text": "시원한 길만 안내할게요! 먼저 출발/도착을 알려주세요.\n예) 출발 충남대 정문 / 도착 유성온천역"})
+
+
+        if re.search(r'(기능\s*설명|도움말|사용법|사용\s*방법|help|헬프)', text, re.IGNORECASE):
+            return jsonify({"type": "answer", "text": _ai_help(text)})
+
         log.debug("/ask 수신: message='%s'", text)
 
         if not text:
@@ -337,7 +334,7 @@ def make_chat_blueprint():
 
         # 4) 실패: 구체 사유 반환
         log.debug("  해석 실패 -> err='%s'", err)
-        return jsonify({"type": "answer", "text": err})
+        return jsonify({"type": "answer", "text": err + "\n\n" + _ai_help(text)})
 
     log.debug("make_chat_blueprint: 생성 완료 -> Blueprint 반환")
     return bp
