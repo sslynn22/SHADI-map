@@ -6,8 +6,14 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import csv  # [ADD] 무더위쉼터 CSV 읽기
 from ai_chat.blueprint import make_chat_blueprint
+from typing import Optional, Dict, Any, List, Tuple
+import logging
 
-
+# 로거 기본 설정 (main.py 상단 어딘가에 추가)
+logging.basicConfig(level=logging.DEBUG,
+                    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
+logger = logging.getLogger("SHADI.rate")
+                           
 # ── api_keys.env 로부터 환경변수 로드  ──
 ENV_FILE = os.getenv("API_KEYS_ENV_PATH", "api_keys.env")
 def _load_env_file(path: str):
@@ -41,6 +47,48 @@ DEFAULT_COOL_WEIGHT = float(os.getenv("COOL_WEIGHT", "0.8"))
 KAKAO_JS_KEY = os.getenv("KAKAO_JS_KEY", "")
 
 HOT_SHELTER_CSV = os.getenv("HOT_SHELTER_CSV", "data/유성구_무더위쉼터_20250817.csv")  # [ADD]
+
+# env knobs
+MIN_SHOW_SCORE = float(os.getenv("MIN_SHOW_SCORE", "0.35"))  # 0~1 예상평점 하한
+MAX_SHOW = int(os.getenv("MAX_SHOW", "3"))                   # 최대 노출 개수
+
+# [BANDIT] 안전 로드 (없어도 서비스 동작)
+try:
+    from ai_bandit import get_bandit, Candidate  # 실제 밴딧
+except Exception:
+    # 밴딧 모듈이 없어도 앱이 죽지 않게 더미 클래스 제공
+    class Candidate:
+        def __init__(self, kind, total_m=None, avg_shade=None):
+            self.kind = kind
+            self.total_m = total_m
+            self.avg_shade = avg_shade
+
+    class _NoopBandit:
+        def rank(self, stamp, src, dst, cands: dict):
+            # 기본 정렬: 시원(coolest) → 최단(shortest) → 쉼터(shelter)
+            order = [k for k in ("coolest", "shortest", "shelter") if cands.get(k) and cands[k].total_m is not None]
+            scores = {k: 0.0 for k in cands.keys()}
+            return order, scores, {}
+        def make_features(self, stamp, cand, ref_dist):
+            return {}
+        def update(self, *args, **kwargs):
+            return
+
+    def get_bandit(pg_url, alpha=0.6):
+        return _NoopBandit()
+
+BANDIT = get_bandit(PG_URL, alpha=0.6)  # 이 줄은 그대로 유지
+
+def _ensure_pgr_tables(conn) -> None:
+    """ways_raw / ways_raw_vertices_pgr 존재 안 하면 ValueError를 던진다."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('public.ways_raw')")
+        a = cur.fetchone()[0]
+        cur.execute("SELECT to_regclass('public.ways_raw_vertices_pgr')")
+        b = cur.fetchone()[0]
+    if a is None or b is None:
+        raise ValueError("pgRouting 테이블(ways_raw / ways_raw_vertices_pgr)이 없습니다. "
+                         "OSM 데이터를 pgRouting으로 로드했는지 확인하세요.")
 
 def _parse_coord_pair(s: str):
     if not s: return None
@@ -76,6 +124,34 @@ def _validate_table(prefix: str, stamp: str) -> str:
         stamp = DEFAULT_STAMP
     return f"{prefix}_{stamp}"
 
+# ───────────────────── 쉼터 우선 경로(추가) ─────────────────────
+def _get_first_float(row, keys):
+    for k in keys:
+        v = row.get(k)
+        if v is None: continue
+        try:
+            return float(str(v).strip())
+        except: pass
+    return None
+
+def _read_hot_shelters():
+    rows = []
+    if not os.path.exists(HOT_SHELTER_CSV):
+        return rows
+    for enc in ("utf-8-sig", "cp949"):
+        try:
+            with open(HOT_SHELTER_CSV, "r", encoding=enc, newline="") as f:
+                reader = csv.DictReader(f)
+                for r in reader:
+                    lat = _get_first_float(r, ["위도","lat","Lat","Y","y"])
+                    lng = _get_first_float(r, ["경도","lng","Lng","X","x"])
+                    if lat is None or lng is None: continue
+                    rows.append({"lat": lat, "lng": lng})
+            break
+        except Exception:
+            continue
+    return rows
+
 # ───────────────────────── 기존 경로(최단/시원) ─────────────────────────
 def _fetch_routes(conn_dsn: str, src: tuple, dst: tuple, union_table: str, cool_weight: float):
     union_table = _validate_table("shadow_union", union_table.split("_", 2)[-1])
@@ -87,6 +163,7 @@ def _fetch_routes(conn_dsn: str, src: tuple, dst: tuple, union_table: str, cool_
             SET LOCAL jit = OFF;
             SET LOCAL work_mem = '256MB';
         """)
+        _ensure_pgr_tables(conn)
         q_edges = f"""
 DROP TABLE IF EXISTS edges_tmp;
 CREATE TEMP TABLE edges_tmp AS
@@ -149,11 +226,16 @@ FROM edges;
         cur.execute("CREATE INDEX IF NOT EXISTS edges_tmp_id_idx ON edges_tmp(id);")
         cur.execute("CREATE INDEX IF NOT EXISTS edges_tmp_st_idx ON edges_tmp(source, target);")
         sql_route = f"""
+
 WITH
 ok_v AS (
   SELECT v.id, v.the_geom
   FROM ways_raw_vertices_pgr v
-  JOIN (SELECT source AS vid FROM ways_raw UNION SELECT target AS vid FROM ways_raw) ok ON ok.vid = v.id
+  JOIN (
+    SELECT source AS vid FROM edges_tmp
+    UNION
+    SELECT target AS vid FROM edges_tmp
+  ) ok ON ok.vid = v.id
 ),
 src AS (SELECT id FROM ok_v ORDER BY the_geom <-> ST_SetSRID(ST_Point(%s,%s), 4326) LIMIT 1),
 dst AS (SELECT id FROM ok_v ORDER BY the_geom <-> ST_SetSRID(ST_Point(%s,%s), 4326) LIMIT 1),
@@ -186,6 +268,7 @@ SELECT 'coolest'  AS kind, ST_AsGeoJSON(geom) AS gj, total_m, avg_shade_ratio FR
 """
         cur.execute(sql_route, (src[0], src[1], dst[0], dst[1]))
         rows = cur.fetchall()
+
     out = {}
     for r in rows:
         gj = json.loads(r["gj"]) if r["gj"] else None
@@ -194,68 +277,76 @@ SELECT 'coolest'  AS kind, ST_AsGeoJSON(geom) AS gj, total_m, avg_shade_ratio FR
             "total_m": float(r["total_m"]) if r["total_m"] is not None else None,
             "avg_shade_ratio": float(r["avg_shade_ratio"]) if r["avg_shade_ratio"] is not None else None
         }
+
+    # 쉼터
+    try:
+        via_shelter, shelter_dbg = _fetch_route_via_shelter(conn_dsn, src, dst, union_table, debug=True)
+    except Exception as e:
+        via_shelter, shelter_dbg = None, {"stage":"error", "messages":[f"{e!r}"]}
+
+    if shelter_dbg and (shelter_dbg.get("stage") != "done"):
+      app.logger.info("[shelter] stage=%s csv=%s db_candidates=%s picked=%s tries=%s legs_fail=%s msgs=%s",
+          shelter_dbg.get("stage"),
+          shelter_dbg.get("csv_count"), shelter_dbg.get("db_candidates"),
+          shelter_dbg.get("picked"),    shelter_dbg.get("tries"),
+          shelter_dbg.get("legs_fail"), shelter_dbg.get("messages"))
+    
+    out["shelter"] = via_shelter
+    out["_shelter_debug"] = shelter_dbg  # debug=1일 때만 프론트가 보게 할 수도 있음
     return out
 
-# ───────────────────── 쉼터 우선 경로(추가) ─────────────────────
-def _read_hot_shelters():
-    rows = []
-    if not os.path.exists(HOT_SHELTER_CSV):
-        return rows
-    for enc in ("utf-8-sig", "cp949"):
-        try:
-            with open(HOT_SHELTER_CSV, "r", encoding=enc, newline="") as f:
-                reader = csv.DictReader(f)
-                for r in reader:
-                    try:
-                        lat = float(str(r.get("위도", "")).strip())
-                        lng = float(str(r.get("경도", "")).strip())
-                        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
-                            continue
-                        rows.append({"lat":lat, "lng":lng})
-                    except Exception:
-                        continue
-            break
-        except Exception:
-            continue
-    return rows
 
-def _fetch_route_via_shelter(conn_dsn: str, src: tuple, dst: tuple, union_table: str, max_candidates:int=6):
+
+def _fetch_route_via_shelter(conn_dsn: str, src: tuple, dst: tuple, union_table: str,
+                             max_candidates:int=6, debug:bool=False):
     """
-    src,dst: (lon,lat)
-    '쉼터 경유' 최단 경로. 후보 쉼터 몇 개를 골라 출발→쉼터 + 쉼터→도착 두 번의 dijkstra 합산이 가장 짧은 경로를 반환.
+    return: (best, dbg) if debug else best
+    best: {"gj": GeoJSON, "total_m": float, "avg_shade_ratio": float|None, "via": {"lon":..,"lat":..}}
     """
+    dbg = {"stage":"start", "csv_count":0, "db_candidates":0, "picked":0, "tries":0, "legs_fail":0,
+           "messages":[]}
+
     union_table = _validate_table("shadow_union", union_table.split("_", 2)[-1])
+    stamp = union_table.split("_", 2)[-1]
     shelters = _read_hot_shelters()
-    if not shelters:
-        return None
+    dbg["csv_count"] = len(shelters)
 
-    # 간단 후보 추리: src/dst 경계 + 여유(약 0.02° ≈ 2km)
+    conninfo = conn_dsn + "?application_name=shadi_route_via_shelter"
+
+    # CSV 없으면 DB에서 후보 추출
+    with psycopg2.connect(conninfo) as conn:
+        if not shelters:
+            try:
+                if _table_exists(conn, "public", _validate_table("shadow_shelter", stamp)):
+                    db_cands = _shelter_candidates_from_db(conn, stamp, src, dst)
+                    dbg["db_candidates"] = len(db_cands)
+                    shelters = db_cands
+                    if not shelters:
+                        dbg["messages"].append("DB 테이블은 있으나 코리도어 교차 쉼터 후보 0개")
+                else:
+                    dbg["messages"].append(f"shadow_shelter_{stamp} 테이블 없음")
+            except Exception as e:
+                dbg["messages"].append(f"DB 후보 추출 오류: {e!r}")
+
+    if not shelters:
+        dbg["stage"] = "no_candidates"
+        return (None, dbg) if debug else None
+
+    # bbox 기반 후보 슬라이싱
     minx = min(src[0], dst[0]); maxx = max(src[0], dst[0])
     miny = min(src[1], dst[1]); maxy = max(src[1], dst[1])
     padx = max(0.02, abs(maxx-minx)*0.3)
     pady = max(0.02, abs(maxy-miny)*0.3)
     cand = [s for s in shelters if (minx-padx)<=s["lng"]<=(maxx+padx) and (miny-pady)<=s["lat"]<=(maxy+pady)]
     if not cand:
-        # 없으면 전체에서 src-dst 중점에 가까운 순 상위
         mid_lon = (src[0]+dst[0])/2; mid_lat = (src[1]+dst[1])/2
         cand = sorted(shelters, key=lambda s:(s["lng"]-mid_lon)**2+(s["lat"]-mid_lat)**2)
 
     cand = cand[:max_candidates]
+    dbg["picked"] = len(cand)
 
-    best = None
-    conninfo = conn_dsn + "?application_name=shadi_route_via_shelter"
-    with psycopg2.connect(conninfo) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            SET LOCAL statement_timeout = '60s';
-            SET LOCAL idle_in_transaction_session_timeout = '30s';
-            SET LOCAL jit = OFF;
-            SET LOCAL work_mem = '256MB';
-        """)
-        # 반복: 후보 쉼터 하나씩 평가
-        for s in cand:
-            via = (s["lng"], s["lat"])
-            # 1) 두 구간의 코리도어를 합친 edges_tmp_via 생성
-            q_edges_via = f"""
+    # === 여기가 빠지면 안 됩니다: via 코리도어 edge 생성 & 두 구간 경로 SQL ===
+    q_edges_via = f"""
 DROP TABLE IF EXISTS edges_tmp_via;
 CREATE TEMP TABLE edges_tmp_via AS
 WITH
@@ -315,24 +406,24 @@ edges AS (
 )
 SELECT id, source, target, geom, len_m, shade_ratio FROM edges;
 """
-            cur.execute(q_edges_via, (src[0], src[1], via[0], via[1], dst[0], dst[1]))
-            cur.execute("CREATE INDEX IF NOT EXISTS edges_tmp_via_id_idx ON edges_tmp_via(id);")
-            cur.execute("CREATE INDEX IF NOT EXISTS edges_tmp_via_st_idx ON edges_tmp_via(source, target);")
 
-            # 2) 출발→쉼터, 쉼터→도착 두 구간 최단으로 연결
-            q_route_via = """
+    q_route_via = """
 WITH
 ok_v AS (
   SELECT v.id, v.the_geom
   FROM ways_raw_vertices_pgr v
-  JOIN (SELECT source AS vid FROM ways_raw UNION SELECT target AS vid FROM ways_raw) ok ON ok.vid = v.id
+  JOIN (
+    SELECT source AS vid FROM edges_tmp_via
+    UNION
+    SELECT target AS vid FROM edges_tmp_via
+  ) ok ON ok.vid = v.id
 ),
 srcpt AS (SELECT ST_SetSRID(ST_Point(%s,%s), 4326) AS g),
 viapt AS (SELECT ST_SetSRID(ST_Point(%s,%s), 4326) AS g),
 dstpt AS (SELECT ST_SetSRID(ST_Point(%s,%s), 4326) AS g),
-src AS (SELECT id FROM ok_v ORDER BY the_geom <-> (SELECT g FROM srcpt) LIMIT 1),
-via AS (SELECT id FROM ok_v ORDER BY the_geom <-> (SELECT g FROM viapt) LIMIT 1),
-dst AS (SELECT id FROM ok_v ORDER BY the_geom <-> (SELECT g FROM dstpt) LIMIT 1),
+src  AS (SELECT id FROM ok_v ORDER BY the_geom <-> (SELECT g FROM srcpt) LIMIT 1),
+via  AS (SELECT id FROM ok_v ORDER BY the_geom <-> (SELECT g FROM viapt) LIMIT 1),
+dst  AS (SELECT id FROM ok_v ORDER BY the_geom <-> (SELECT g FROM dstpt) LIMIT 1),
 
 leg1 AS (
   SELECT * FROM pgr_dijkstra(
@@ -353,7 +444,9 @@ p1 AS (
 p2 AS (
   SELECT ST_LineMerge(ST_Union(e.geom)) AS geom, SUM(e.len_m) AS total_m, AVG(e.shade_ratio) AS avg_shade_ratio
   FROM leg2 s JOIN edges_tmp_via e ON s.edge = e.id WHERE s.edge <> -1
-)
+),
+n1 AS (SELECT COUNT(*) AS cnt FROM leg1 WHERE edge <> -1),
+n2 AS (SELECT COUNT(*) AS cnt FROM leg2 WHERE edge <> -1)
 SELECT
   ST_AsGeoJSON(ST_LineMerge(ST_Union(ARRAY[(SELECT geom FROM p1),(SELECT geom FROM p2)]))) AS gj,
   COALESCE((SELECT total_m FROM p1),0) + COALESCE((SELECT total_m FROM p2),0) AS total_m,
@@ -364,20 +457,59 @@ SELECT
       + COALESCE((SELECT avg_shade_ratio FROM p2),0) * COALESCE((SELECT total_m FROM p2),0)
     ) / NULLIF(COALESCE((SELECT total_m FROM p1),0) + COALESCE((SELECT total_m FROM p2),0), 0)
     ELSE NULL
-  END AS avg_shade_ratio;
+  END AS avg_shade_ratio,
+  (SELECT cnt FROM n1) AS n1_edges,
+  (SELECT cnt FROM n2) AS n2_edges;
 """
-            cur.execute(q_route_via, (src[0], src[1], via[0], via[1], dst[0], dst[1]))
-            row = cur.fetchone()
-            gj = json.loads(row["gj"]) if row and row["gj"] else None
-            total_m = float(row["total_m"]) if row and row["total_m"] is not None else None
-            avg_shade = float(row["avg_shade_ratio"]) if row and row["avg_shade_ratio"] is not None else None
 
-            if gj and total_m:
-                cand_out = {"gj": gj, "total_m": total_m, "avg_shade_ratio": avg_shade, "via": {"lon": via[0], "lat": via[1]}}
-                if (best is None) or (total_m < best["total_m"]):
-                    best = cand_out
+    best = None
+    with psycopg2.connect(conninfo) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SET LOCAL statement_timeout = '60s';
+            SET LOCAL idle_in_transaction_session_timeout = '30s';
+            SET LOCAL jit = OFF;
+            SET LOCAL work_mem = '256MB';
+        """)
+        _ensure_pgr_tables(conn)
+        for s in cand:
+            dbg["tries"] += 1
+            via = (s["lng"], s["lat"])
+            try:
+                cur.execute(q_edges_via, (src[0], src[1], via[0], via[1], dst[0], dst[1]))
+                cur.execute("CREATE INDEX IF NOT EXISTS edges_tmp_via_id_idx ON edges_tmp_via(id);")
+                cur.execute("CREATE INDEX IF NOT EXISTS edges_tmp_via_st_idx ON edges_tmp_via(source, target);")
 
-    return best
+                cur.execute(q_route_via, (src[0], src[1], via[0], via[1], dst[0], dst[1]))
+                row = cur.fetchone()
+                if not row:
+                    dbg["legs_fail"] += 1
+                    dbg["messages"].append("경로쿼리 결과 없음")
+                    continue
+
+                n1 = int(row.get("n1_edges") or 0)
+                n2 = int(row.get("n2_edges") or 0)
+                if n1 <= 0 or n2 <= 0:
+                    dbg["legs_fail"] += 1
+                    dbg["messages"].append(f"leg 실패: n1={n1}, n2={n2}")
+                    continue
+
+                gj = json.loads(row["gj"]) if row["gj"] else None
+                total_m = float(row["total_m"]) if row["total_m"] is not None else None
+                avg_shade = float(row["avg_shade_ratio"]) if row["avg_shade_ratio"] is not None else None
+
+                if gj and total_m:
+                    cand_out = {"gj": gj, "total_m": total_m, "avg_shade_ratio": avg_shade,
+                                "via": {"lon": via[0], "lat": via[1]}}
+                    if (best is None) or (total_m < best["total_m"]):
+                        best = cand_out
+            except Exception as e:
+                conn.rollback()
+                dbg["messages"].append(f"쿼리 오류: {e!r}")
+                continue
+
+    dbg["stage"] = "done" if best else "no_path"
+    return (best, dbg) if debug else best
+
 
 # ───────────────────────── 그림자 GeoJSON ─────────────────────────
 def _fetch_shadow_any(conn_dsn: str, table_prefix: str, stamp: str, bbox: tuple|None, simplify_tol_m: float = 0.7):
@@ -477,6 +609,49 @@ SELECT ST_AsGeoJSON(ST_Transform(ST_Collect(g5179),4326)) AS gj, COUNT(*) AS cnt
         cnt = int(row["cnt"]) if row and row["cnt"] is not None else 0
         return {"gj": gj, "count": cnt, "table": table}
 
+# 테이블 존재 확인
+def _table_exists(conn, schema: str, table: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s)", (f"{schema}.{table}",))
+        return cur.fetchone()[0] is not None
+
+# 쉼터 테이블에서 코리도어 교차 후보 추출 (centroid 사용)
+def _shelter_candidates_from_db(conn, stamp: str, src: Tuple[float,float], dst: Tuple[float,float]) -> List[Dict[str,float]]:
+    shelter_table = _validate_table("shadow_shelter", stamp)
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SET LOCAL statement_timeout = '30s';
+            SET LOCAL jit = OFF;
+        """)
+        q = f"""
+WITH
+params AS (SELECT 250::float8 AS corridor_m),
+srcpt AS (SELECT ST_SetSRID(ST_Point(%s,%s), 4326) AS g4326),
+dstpt AS (SELECT ST_SetSRID(ST_Point(%s,%s), 4326) AS g4326),
+corridor AS (
+  SELECT ST_Buffer(
+           ST_Transform(ST_MakeLine((SELECT g4326 FROM srcpt),(SELECT g4326 FROM dstpt)),5179),
+           (SELECT corridor_m FROM params)
+         ) AS g5179
+)
+SELECT
+  ST_X(ST_Centroid(s.geometry)) AS lon,
+  ST_Y(ST_Centroid(s.geometry)) AS lat
+FROM {shelter_table} s
+JOIN corridor c
+  ON ST_Intersects(ST_Transform(s.geometry,5179), c.g5179)
+LIMIT 500;
+"""
+        cur.execute(q, (src[0], src[1], dst[0], dst[1]))
+        rows = cur.fetchall() or []
+        out = []
+        for r in rows:
+            try:
+                lon = float(r["lon"]); lat = float(r["lat"])
+                if -180<=lon<=180 and -90<=lat<=90: out.append({"lng":lon, "lat":lat})
+            except Exception:
+                continue
+        return out
 
 MAP_HTML = r"""<!doctype html>
 <html lang="ko">
@@ -487,6 +662,7 @@ MAP_HTML = r"""<!doctype html>
   <!-- Kakao SDK: services 라이브러리 포함 -->
   <script defer src="https://dapi.kakao.com/v2/maps/sdk.js?appkey={{ kakao_js_key }}&autoload=false&libraries=services"></script>
   <style>
+    #shadow-stats { display: none !important; }
     html, body, #map { height: 100%; margin: 0; }
     #panel {
       position:absolute; top:10px; right:10px; z-index:1000;
@@ -501,6 +677,9 @@ MAP_HTML = r"""<!doctype html>
     #panel .ghost{background:#f1f3f5; color:#222}
     #shadow-stats {font-size:12px; color:#333; margin-top:6px; line-height:1.4}
     .chip{display:inline-block; width:12px; height:12px; border-radius:3px; margin-right:6px; vertical-align:middle}
+    .nowrap{ white-space:nowrap }
+    .row-nowrap{ display:flex; gap:10px; align-items:center; flex-wrap:nowrap }
+    .chip-sm{ display:inline-block; width:12px; height:12px; border-radius:3px; margin-right:6px; vertical-align:middle }
 
     /* ==== 좌측하단 경로 패널 ==== */
     #routes-panel{
@@ -532,6 +711,13 @@ MAP_HTML = r"""<!doctype html>
     .route-meta  { display:flex; gap:10px; align-items:center; color:#444; font-size:12px; }
     .route-meta span { white-space:nowrap; }
     .muted { color:#6b7280 }
+    .stars{ display:flex; gap:4px; align-items:center; margin-top:6px; }
+    .star-btn{
+      border:0; background:transparent; cursor:pointer; font-size:18px; line-height:1;
+      padding:2px; color:#d1d5db;
+    }
+    .star-btn.active{ color:#f59e0b; } /* 선택된 별은 노랑 */
+    .rate-msg{ font-size:11px; color:#444; margin-left:6px; }
   </style>
 </head>
 <body>
@@ -559,7 +745,7 @@ MAP_HTML = r"""<!doctype html>
   <input id="src" type="text" placeholder="예: 36.361738, 127.344776">
   <label>도착 (lat, lon)</label>
   <input id="dst" type="text" placeholder="예: 36.372113, 127.345180">
-  <label>분석시각</label>
+  <label>현재 시간</label>
   <input id="time" type="datetime-local" value="2025-08-18T14:00">
 
   <label>장소 검색</label>
@@ -580,20 +766,35 @@ MAP_HTML = r"""<!doctype html>
 
   <div style="font-size:13px; font-weight:600; margin:10px 0 4px">그림자 레이어</div>
   <div class="row" style="gap:10px; justify-content:space-between">
-    <label style="display:flex; align-items:center; gap:6px; flex:1">
+    <label style="display:flex; align-items:center; gap:6px; flex:1" class="nowrap">
       <input type="checkbox" id="toggle-building" checked>
       <span><span class="chip" style="background:#28252c; border:1px solid #463f4f"></span>건물</span>
     </label>
-    <label style="display:flex; align-items:center; gap:6px; flex:1">
+    <label style="display:flex; align-items:center; gap:6px; flex:1" class="nowrap">
       <input type="checkbox" id="toggle-tree" checked>
       <span><span class="chip" style="background:#7fc97f; border:1px solid #4daf4a"></span>가로수</span>
     </label>
-    <label style="display:flex; align-items:center; gap:6px; flex:1">
+    <label style="display:flex; align-items:center; gap:6px; flex:1" class="nowrap">
       <input type="checkbox" id="toggle-shelter" checked>
-      <span><span class="chip" style="background:#fdae61; border:1px solid #e66101"></span>쉼터</span>
+      <span><span class="chip" style="background:#fdae61; border:1px solid #e66101"></span><span class="nowrap">그늘막쉼터</span></span>
     </label>
-    <button class="ghost" id="refresh-shadow" style="flex:0 0 auto">갱신</button>
   </div>
+  <div id="shadow-stats"></div>
+
+  <div style="font-size:13px; font-weight:600; margin:12px 0 4px">마커 표시</div>
+  <div class="row-nowrap">
+    <label class="nowrap" style="display:flex; align-items:center; gap:6px">
+      <input type="checkbox" id="toggle-heat-markers" checked>
+      <span><span class="chip-sm" style="background:#f39c12; border:1px solid #d8890f"></span>무더위 쉼터</span>
+    </label>
+    <label class="nowrap" style="display:flex; align-items:center; gap:6px">
+      <input type="checkbox" id="toggle-nuisance">
+      <span><span class="chip-sm" style="background:#b91c1c; border:1px solid #7f1d1d"></span>혐오시설</span>
+    </label>
+  </div>
+
+
+
   <div id="shadow-stats"></div>
   <small class="muted">Tip: 지도 클릭으로 출발/도착을 쉽게 찍을 수 있어요.</small>
 </div>
@@ -607,6 +808,14 @@ MAP_HTML = r"""<!doctype html>
 <script>
   window.addEventListener('DOMContentLoaded', () => {
     kakao.maps.load(() => {
+      // [RATE] 최근 경로/입력 상태 저장
+      let selectedKind = null;
+      let navState = 'idle'; // 'idle' | 'navigating' | 'done'
+      let startedAt = null;
+      let lastRouteData = null;   // /route 응답 전체(JSON)
+      let lastSrc = null;         // {lat, lng}
+      let lastDst = null;         // {lat, lng}
+      let lastTime = "";          // "YYYY-MM-DDTHH:mm"
       const $ = (id)=>document.getElementById(id);
 
       const WALK_KMH = 4.0;
@@ -615,52 +824,71 @@ MAP_HTML = r"""<!doctype html>
         center: new kakao.maps.LatLng(36.36917, 127.34515), level: 4
       });
 
-      // ===== [ADD] 무더위쉼터 마커 =====
       const heatMarkers = [];
+
       function sunPinSVG(){
         return `
-        <svg xmlns='http://www.w3.org/2000/svg' width='30' height='42' viewBox='0 0 30 42'>
-          <path fill='#f39c12' d='M15 0C7.3 0 1 6.3 1 14c0 10.1 14 28 14 28s14-17.9 14-28C29 6.3 22.7 0 15 0z'/>
-          <circle cx='15' cy='14' r='5.5' fill='#fff'/>
-          <g transform='translate(15,14)' stroke='#fff' stroke-width='1.4'>
-            <line x1='0' y1='-8.5' x2='0' y2='-5'/>
-            <line x1='0' y1='8.5'  x2='0' y2='5'/>
-            <line x1='8.5' y1='0'  x2='5' y2='0'/>
-            <line x1='-8.5' y1='0' x2='-5' y2='0'/>
-            <line x1='6' y1='6' x2='3.5' y2='3.5'/>
-            <line x1='-6' y1='6' x2='-3.5' y2='3.5'/>
-            <line x1='6' y1='-6' x2='3.5' y2='-3.5'/>
-            <line x1='-6' y1='-6' x2='-3.5' y2='-3.5'/>
-          </g>
-        </svg>`;
+          <svg xmlns='http://www.w3.org/2000/svg' width='30' height='42' viewBox='0 0 30 42'>
+            <path fill='#f39c12' d='M15 0C7.3 0 1 6.3 1 14c0 10.1 14 28 14 28s14-17.9 14-28C29 6.3 22.7 0 15 0z'/>
+            <circle cx='15' cy='14' r='5.5' fill='#fff'/>
+            <g transform='translate(15,14)' stroke='#fff' stroke-width='1.4'>
+              <line x1='0' y1='-8.5' x2='0' y2='-5'/>
+              <line x1='0' y1='8.5'  x2='0' y2='5'/>
+              <line x1='8.5' y1='0'  x2='5' y2='0'/>
+              <line x1='-8.5' y1='0' x2='-5' y2='0'/>
+              <line x1='6' y1='6' x2='3.5' y2='3.5'/>
+              <line x1='-6' y1='6' x2='-3.5' y2='3.5'/>
+              <line x1='6' y1='-6' x2='3.5' y2='-3.5'/>
+              <line x1='-6' y1='-6' x2='-3.5' y2='-3.5'/>
+            </g>
+          </svg>`;
       }
+
       const HEAT_PIN = new kakao.maps.MarkerImage(
         'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(sunPinSVG()),
         new kakao.maps.Size(30, 42),
         { offset: new kakao.maps.Point(15, 42) }
       );
+
       function escapeHtml(s){
         return String(s||"").replace(/[&<>"']/g, m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m]));
       }
+
+      // ===== [ADD] 무더위쉼터 마커 =====
       function addHeatMarker(lat, lng, name, addr, hours){
-        const ll = new kakao.maps.LatLng(lat, lng);
+         const ll = new kakao.maps.LatLng(lat, lng);
+
+        // 처음엔 지도에 붙이지 않음 → 체크박스로 제어
         const mk = new kakao.maps.Marker({ position: ll, image: HEAT_PIN });
-        mk.setMap(map); heatMarkers.push(mk);
-        const html = `<div style="padding:8px 10px; font-size:12px; line-height:1.35; max-width:260px">
-            <b>${escapeHtml(name)}</b><br/>${escapeHtml(addr)}<br/>운영 시간: ${escapeHtml(hours)}</div>`;
-        const iw = new kakao.maps.InfoWindow({ content: html, removable: true });
-        kakao.maps.event.addListener(mk, 'click', () => iw.open(map, mk));
+        heatMarkers.push(mk);
+         const html = `<div style="padding:8px 10px; font-size:12px; line-height:1.35; max-width:260px">
+             <b>${escapeHtml(name)}</b><br/>${escapeHtml(addr)}<br/>운영 시간: ${escapeHtml(hours)}</div>`;
+         const iw = new kakao.maps.InfoWindow({ content: html, removable: true });
+         kakao.maps.event.addListener(mk, 'click', () => iw.open(map, mk));
+       }
+
+      // 체크박스 상태에 따라 마커 일괄 on/off
+      function applyHeatMarkerVisibility(){
+        const on = (document.getElementById('toggle-heat-markers')||{}).checked;
+        heatMarkers.forEach(mk => mk.setMap(on ? map : null));
       }
-      async function loadHotShelters(){
-        try{
-          const res = await fetch('/hot-shelters');
-          const list = await res.json();
-          if(Array.isArray(list)){
-            list.forEach(s => addHeatMarker(s.lat, s.lng, s.name || "무더위쉼터", s.addr || "", s.hours || ""));
-          }
-        }catch(e){ console.warn('hot-shelters load failed:', e); }
-      }
+
+       async function loadHotShelters(){
+         try{
+           const res = await fetch('/hot-shelters');
+           const list = await res.json();
+           if(Array.isArray(list)){
+             list.forEach(s => addHeatMarker(s.lat, s.lng, s.name || "무더위쉼터", s.addr || "", s.hours || ""));
+            // 데이터 로딩 후 현재 체크 상태를 반영
+            applyHeatMarkerVisibility();
+           }
+         }catch(e){ console.warn('hot-shelters load failed:', e); }
+       }
       loadHotShelters();
+      // 체크박스 토글 시 즉시 반영
+      const heatTgl = document.getElementById('toggle-heat-markers');
+      if(heatTgl){ heatTgl.onchange = applyHeatMarkerVisibility; }
+
       // ===== [ADD] 끝 =====
 
       // ====== 출발/도착 핀 ======
@@ -685,7 +913,6 @@ MAP_HTML = r"""<!doctype html>
       let srcLL=null, dstLL=null;
       let shortestPolyline=null, coolestPolyline=null, shelterPolyline=null; // [ADD] shelter
       let searchMarkers=[];
-      let selectedKind = null;
       let allowedKinds = ['shortest','coolest','shelter'];
       const shadowBuilding=[], shadowTree=[], shadowShelter=[];
       const places = new kakao.maps.services.Places();
@@ -767,6 +994,13 @@ MAP_HTML = r"""<!doctype html>
           runBtn.disabled = true; runBtn.innerText = "계산중...";
           try{
             const res = await fetch('/route?'+qs); const js = await res.json();
+            // [RATE] 상태 저장
+            lastRouteData = js;
+            lastTime = t;
+            // srcLL/dstLL가 없으면 입력칸에서 파싱된 s/d 사용
+            lastSrc = srcLL ? {lat: srcLL.lat, lng: srcLL.lng} : {lat: s[1], lng: s[0]};
+            lastDst = dstLL ? {lat: dstLL.lat, lng: dstLL.lng} : {lat: d[1], lng: d[0]};
+
             if(!res.ok) throw new Error(js.error || "route API 실패");
 
             // 기존 선 지우기
@@ -776,31 +1010,38 @@ MAP_HTML = r"""<!doctype html>
             shortestPolyline=coolestPolyline=shelterPolyline=null;
             selectedKind=null;
 
-            // 새 선 생성
+            // 새 선 생성 + 미리보기 표시
             if(js.shortest && js.shortest.gj){
-              shortestPolyline = polylineFromGeoJSON(js.shortest.gj, {strokeWeight:6, strokeColor:'#1BA952', strokeOpacity:0.95});
-              shortestPolyline.setMap(map);
+              shortestPolyline = polylineFromGeoJSON(
+                js.shortest.gj, { strokeWeight:6, strokeColor:'#1BA952', strokeOpacity:0.7 }
+              );
+              if (allowedKinds.includes('shortest')) shortestPolyline.setMap(map);
             }
             if(js.coolest && js.coolest.gj){
-              coolestPolyline  = polylineFromGeoJSON(js.coolest.gj, {strokeWeight:6, strokeColor:'#46e583', strokeOpacity:0.95});
-              coolestPolyline.setMap(map);
+              coolestPolyline = polylineFromGeoJSON(
+                js.coolest.gj, { strokeWeight:6, strokeColor:'#46e583', strokeOpacity:0.7 }
+              );
+              if (allowedKinds.includes('coolest')) coolestPolyline.setMap(map);
             }
             if(js.shelter && js.shelter.gj){
-              shelterPolyline = polylineFromGeoJSON(js.shelter.gj, {strokeWeight:6, strokeColor:'#03491e', strokeOpacity:0.95}); // [ADD] 보라
-              shelterPolyline.setMap(map);
+              shelterPolyline = polylineFromGeoJSON(
+                js.shelter.gj, { strokeWeight:6, strokeColor:'#03491e', strokeOpacity:0.7 }
+              );
+              if (allowedKinds.includes('shelter')) shelterPolyline.setMap(map);
             }
 
-            // 지도 bounds
-            const lines=[shortestPolyline, coolestPolyline, shelterPolyline].filter(Boolean);
-            if(lines.length){
+            // 세 선의 합쳐진 영역으로 화면 맞추기 (있을 때만)
+            (function fitAll(){
+              const lines = [shortestPolyline, coolestPolyline, shelterPolyline].filter(Boolean)
+              if(!lines.length) return;
               const bounds = new kakao.maps.LatLngBounds();
-              lines.forEach(pl => pl.getPath().forEach(ll => bounds.extend(ll)));
+              lines.forEach(line => line.getPath().forEach(ll => bounds.extend(ll)));
               map.setBounds(bounds, 30, 30, 30, 30);
-            }
+            })();
 
             // 경로 카드 렌더 (쉼터우선 → 시원 → 최단)
             renderRouteCards(js);
-
+          
             // runBtn.onclick 내부, 폴리라인 생성 직후 아래 줄 추가
             // ... 폴리라인들 생성(setMap) 이후
             if(!allowedKinds.includes('shortest') && shortestPolyline){ shortestPolyline.setMap(null); }
@@ -812,16 +1053,58 @@ MAP_HTML = r"""<!doctype html>
         };
       }
 
+      function collectMetrics(d){
+        const pick = (k)=> d[k] && d[k].total_m!=null ? {
+          total_m: d[k].total_m,
+          avg_shade_ratio: d[k].avg_shade_ratio ?? null
+        } : null;
+        return { shortest: pick('shortest'), coolest: pick('coolest'), shelter: pick('shelter') };
+      }
+
+      async function submitRating(kind, rating, starsWrap){
+        if(!lastRouteData || !lastSrc || !lastDst){
+          alert('경로 정보가 없습니다. 먼저 경로를 실행하세요.');
+          return;
+        }
+        const body = {
+          kind,
+          rating,
+          src: `${lastSrc.lat},${lastSrc.lng}`,
+          dst: `${lastDst.lat},${lastDst.lng}`,
+          time: lastTime || "",
+          metrics: collectMetrics(lastRouteData)
+        };
+        const msgEl = starsWrap?.querySelector?.('[data-rate-msg]');
+        try{
+          const res = await fetch('/rate', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify(body)
+          });
+          const js = await res.json();
+          if(!res.ok || !js.ok) throw new Error(js.error || '제출 실패');
+          if(msgEl) msgEl.textContent = '평가가 저장되었어요. 고마워요!';
+        }catch(err){
+          if(msgEl) msgEl.textContent = '제출에 실패했어요: ' + err.message;
+        }
+      }
+
+
       // 경로 카드 렌더링 + 동작
       function renderRouteCards(data){
-        const routesEl = $('routes'); if(!routesEl) return;
+        const routesEl = $('routes');
+        if(!routesEl) return;
+
         const items = [];
-        function build(kind, titleClass, titleText, obj){
-          if(!allowedKinds.includes(kind)) return;  // ⬅️ 추가: 허용된 종류만
+
+        function card(kind, titleClass, titleText, obj){
+          if(!allowedKinds.includes(kind)) return;
           if(!obj || !obj.gj || obj.total_m==null) return;
+
           const m = obj.total_m;
           const min = walkMinutesFromMeters(m);
           const minInt = fmtMinInt(min);
+
           const html = `
             <div class="route-card" data-kind="${kind}">
               <div class="route-time">${minInt}<span class="unit">분</span></div>
@@ -829,67 +1112,135 @@ MAP_HTML = r"""<!doctype html>
                 <div class="${titleClass}">${titleText}</div>
                 <div class="route-meta">
                   <span>거리 ${fmtDist(m)}</span>
-                  <span>/ shade ${fmtPct(obj.avg_shade_ratio)}</span>
+                  <span>/ 그림자 ${fmtPct(obj.avg_shade_ratio)}</span>
+                </div>
+                <div style="margin-top:6px">
+                  <button class="btn" data-action="choose" data-kind="${kind}">이 경로 선택</button>
                 </div>
               </div>
             </div>`;
           items.push(html);
         }
-          build('coolest','title-coolest','시원한길', data.coolest);
-          build('shortest','title-shortest','최단거리', data.shortest);
-          build('shelter','title-shelter','쉼터우선', data.shelter);
 
-          routesEl.innerHTML = items.join('') || '<div class="muted">경로가 없습니다.</div>';
+        const order = Array.isArray(data.order) && data.order.length
+          ? data.order : ['coolest','shortest','shelter'];
 
-          // ⬇️ 자동 선택 로직 변경:
-          // - 단일 모드(키워드가 있어 allowedKinds가 1개)일 때만 자동 선택해서 단일 라인만 보이게
-          // - 복수 모드(키워드 없음)라면 자동 선택 안 함 → 지도에 3개 라인 모두 표시 유지
-          if (allowedKinds.length === 1) {
-            const onlyKind = allowedKinds[0];
-            if (data[onlyKind] && data[onlyKind].gj) {
-              selectRoute(onlyKind);
-            }
-         } else {
-           // 복수 모드: 모든 라인을 그대로 보이게 두고, 카드 활성표시는 초기엔 없음
-           routesEl.querySelectorAll('.route-card').forEach(card => card.classList.remove('active'));
-         }
+        items.length = 0;
+        order.forEach(k=>{
+          if(k==='coolest')  card('coolest','title-coolest','시원한길', data.coolest);
+          if(k==='shortest') card('shortest','title-shortest','최단거리', data.shortest);
+          if(k==='shelter')  card('shelter','title-shelter','쉼터우선', data.shelter);
+        });
 
-          routesEl.onclick = (e)=>{ 
-            const card = e.target.closest('.route-card');
-            if(!card) return;
-            selectRoute(card.getAttribute('data-kind'));
+        routesEl.innerHTML = items.join('') || '<div class="muted">경로가 없습니다.</div>';
+
+        // 카드 클릭(선택 버튼만 유효)
+        routesEl.onclick = (e)=>{
+          const btn = e.target.closest('button[data-action="choose"]');
+          if(!btn) return;
+          chooseRoute(btn.getAttribute('data-kind'));
         };
       }
 
-      function setLineColor(line, color){ if(line) line.setOptions({ strokeColor: color }); }
-      function selectRoute(kind){
-        selectedKind = kind;
-        if(kind === 'shortest'){
-          setLineColor(shortestPolyline, '#1BA952');
-          setLineColor(coolestPolyline,  '#46e583');
-          setLineColor(shelterPolyline,  '#03491e');
-          if(shortestPolyline) shortestPolyline.setMap(map);
-          if(coolestPolyline)  coolestPolyline.setMap(null);
-          if(shelterPolyline)  shelterPolyline.setMap(null);
-        }else if(kind === 'coolest'){
-          setLineColor(coolestPolyline,  '#46e583');
-          setLineColor(shortestPolyline, '#1BA952');
-          setLineColor(shelterPolyline,  '#03491e');
-          if(coolestPolyline)  coolestPolyline.setMap(map);
-          if(shortestPolyline) shortestPolyline.setMap(null);
-          if(shelterPolyline)  shelterPolyline.setMap(null);
-        }else if(kind === 'shelter'){
-          setLineColor(shelterPolyline,  '#03491e');
-          setLineColor(shortestPolyline, '#1BA952');
-          setLineColor(coolestPolyline,  '#46e583');
-          if(shelterPolyline)  shelterPolyline.setMap(map);
-          if(shortestPolyline) shortestPolyline.setMap(null);
-          if(coolestPolyline)  coolestPolyline.setMap(null);
+      function fitToLine(line){
+        if(!line) return;
+        const bounds = new kakao.maps.LatLngBounds();
+        line.getPath().forEach(ll => bounds.extend(ll));
+        map.setBounds(bounds, 30, 30, 30, 30);
+      }
+
+      function showOnly(kind){
+        if(shortestPolyline) shortestPolyline.setMap(null);
+        if(coolestPolyline)  coolestPolyline.setMap(null);
+        if(shelterPolyline)  shelterPolyline.setMap(null);
+
+        if(kind==='shortest' && shortestPolyline){
+          shortestPolyline.setMap(map); fitToLine(shortestPolyline);
         }
-        const routesEl = $('routes'); if(!routesEl) return;
+        if(kind==='coolest' && coolestPolyline){
+          coolestPolyline.setMap(map);  fitToLine(coolestPolyline);
+        }
+        if(kind==='shelter' && shelterPolyline){
+          shelterPolyline.setMap(map);  fitToLine(shelterPolyline);
+        }
+      }
+
+      function chooseRoute(kind){
+        selectedKind = kind;
+        navState = 'idle';
+        startedAt = null;
+
+        showOnly(kind);
+
+        const routesEl = $('routes');
+        // 카드 active 표시
         routesEl.querySelectorAll('.route-card').forEach(card=>{
           card.classList.toggle('active', card.getAttribute('data-kind')===kind);
         });
+
+        // 컨트롤 UI 출력
+        renderNavControls();
+      }
+
+      function renderNavControls(){
+        const routesEl = $('routes');
+        // 기존 컨트롤/평점 박스 제거
+        routesEl.querySelector('#nav-controls')?.remove();
+        routesEl.querySelector('#rating-box')?.remove();
+
+        const html = `
+          <div id="nav-controls" style="margin-top:12px; display:flex; gap:8px">
+            <button class="btn" id="btn-start">길안내 시작</button>
+            <button class="ghost" id="btn-stop" disabled>길안내 종료</button>
+          </div>`;
+        routesEl.insertAdjacentHTML('beforeend', html);
+
+        $('btn-start').onclick = ()=>{
+          if(navState!=='idle') return;
+          navState='navigating';
+          startedAt = Date.now();
+          $('btn-start').disabled = true;
+          $('btn-stop').disabled  = false;
+        };
+        $('btn-stop').onclick = ()=>{
+          if(navState!=='navigating') return;
+          navState='done';
+          $('nav-controls').remove();
+          renderRatingBox();
+        };
+      }
+
+      function renderRatingBox(){
+        const routesEl = $('routes');
+        const html = `
+          <div id="rating-box" style="margin-top:12px; font-size:13px">
+            <div style="font-weight:600; margin-bottom:6px">이 경로는 만족스러우셨나요?</div>
+            <div class="stars" data-kind="${selectedKind}">
+              ${[1,2,3,4,5].map(n=>`<button class="star-btn" data-rate="${n}" aria-label="${n}점">★</button>`).join('')}
+              <span class="rate-msg" data-rate-msg>별을 눌러 평가해 주세요</span>
+            </div>
+          </div>`;
+        routesEl.insertAdjacentHTML('beforeend', html);
+
+        const wrap = routesEl.querySelector('#rating-box .stars');
+        routesEl.querySelectorAll('#rating-box .star-btn').forEach(btn=>{
+          btn.onclick = async ()=>{
+            const rating = parseInt(btn.getAttribute('data-rate'),10);
+            // UI 강조
+            wrap.querySelectorAll('.star-btn').forEach(b=>{
+              const r = parseInt(b.getAttribute('data-rate'),10);
+              b.classList.toggle('active', r <= rating);
+            });
+            // 기존 submitRating 로직을 그대로 사용
+            await submitRating(selectedKind, rating, wrap);
+          };
+        });
+      }
+
+
+      function setLineColor(line, color){ if(line) line.setOptions({ strokeColor: color }); }
+      function selectRoute(kind){
+        chooseRoute(kind);
       }
 
       // ---- Shadow helpers ----
@@ -1126,21 +1477,88 @@ def route():
     dst_s = request.args.get("dst","").strip()
     time_s= request.args.get("time","").strip()
     weight= request.args.get("weight","").strip()
-    src = _parse_coord_pair(src_s); dst = _parse_coord_pair(dst_s)
+
+    src = _parse_coord_pair(src_s)
+    dst = _parse_coord_pair(dst_s)
     if not src or not dst:
         return jsonify(error="Invalid src/dst. Use 'lat,lon' or 'lon,lat'."), 400
-    stamp = _stamp_from_time(time_s); union_table = f"shadow_union_{stamp}"
-    try: cool_weight = float(weight) if weight else DEFAULT_COOL_WEIGHT
-    except Exception: cool_weight = DEFAULT_COOL_WEIGHT
+
+    stamp = _stamp_from_time(time_s)
+    union_table = f"shadow_union_{stamp}"
+    dbg_flag = request.args.get("debug","").strip() in {"1","true","yes"}
+
     try:
-        out = _fetch_routes(PG_URL, src, dst, union_table, cool_weight)  # shortest, coolest
-        # [ADD] 쉼터 우선 경로 추가
+        cool_weight = float(weight) if weight else DEFAULT_COOL_WEIGHT
+    except Exception:
+        cool_weight = DEFAULT_COOL_WEIGHT
+
+    try:
+        # 1) 기본 경로
+        out = _fetch_routes(PG_URL, src, dst, union_table, cool_weight)
+
+        # 3) 컨텍스트 밴딧 정렬/스코어
+        stamp_key = union_table.split("_", 2)[-1]  # 'YYYYMMDD_HHMM'
+        cands = {}
+        for k in ("shortest","coolest","shelter"):
+            v = out.get(k) or {}
+            cands[k] = Candidate(kind=k,
+                                 total_m=v.get("total_m"),
+                                 avg_shade=v.get("avg_shade_ratio"))
+      
         try:
-            via_shelter = _fetch_route_via_shelter(PG_URL, src, dst, union_table)
-        except Exception as _e:
-            via_shelter = None
-        out["shelter"] = via_shelter
+            order, scores, _ = BANDIT.rank(stamp_key, src, dst, cands)
+        except Exception:
+            order = [k for k in ("coolest","shortest","shelter")
+                     if out.get(k) and out[k].get("total_m") is not None]
+            scores = {k: 0.0 for k in ("coolest","shortest","shelter")}
+
+        # 4) 가시성 결정
+        # 점수(+컷) 기반 기본 visible 집합 산정
+        has_positive = any((scores.get(k) or 0.0) > 0.0 for k in order)
+
+        if has_positive:
+            visible = [k for k in order
+                       if (out.get(k) and out[k].get("total_m") is not None
+                           and (scores.get(k, 0.0) >= MIN_SHOW_SCORE))]
+        else:
+            visible = [k for k in order if (out.get(k) and out[k].get("total_m") is not None)]
+            visible = visible[:MAX_SHOW]
+
+        # 최소 1개 보장
+        if not visible and order:
+            visible = [order[0]]
+
+        # (핵심) 쉼터 경로가 있으면 반드시 포함
+        if out.get("shelter") and out["shelter"] and out["shelter"].get("total_m") is not None:
+            if "shelter" not in visible:
+                visible.append("shelter")
+            # 최대 노출 개수 초과 시, shelter는 남기고 다른 것 하나 제거
+            if len(visible) > MAX_SHOW:
+                for k in ("coolest", "shortest"):
+                    if k in visible and k != "shelter":
+                        visible.remove(k)
+                        break
+
+        # 숨긴 후보는 payload에서 None 처리
+        for k in ("shortest","coolest","shelter"):
+            if k not in visible:
+                out[k] = None
+
+        out["order"] = visible
+        out["scores"] = {k: float(scores.get(k, 0.0)) for k in ("coolest","shortest","shelter")}
+        # 디버그일 때 공통 진단 포함
+        if dbg_flag:
+            out.setdefault("_debug", {})
+            # _fetch_routes()가 넣어둔 _shelter_debug를 _debug.shelter로 승격
+            if "_shelter_debug" in out:
+                out["_debug"]["shelter"] = out["_shelter_debug"]
+
+
         return jsonify(out)
+
+    except ValueError as ve:
+        # _ensure_pgr_tables 등에서 오는 친절 메시지
+        return jsonify(error=str(ve)), 400
     except Exception as e:
         return jsonify(error=str(e)), 500
 
@@ -1171,6 +1589,7 @@ def shadow():
 # [ADD] 무더위쉼터 목록 API
 @app.get("/hot-shelters")
 def hot_shelters():
+    app.logger.info("[hot-shelters] reading from %s", HOT_SHELTER_CSV)
     rows = []
     if not os.path.exists(HOT_SHELTER_CSV):
         return jsonify([])
@@ -1197,6 +1616,85 @@ def hot_shelters():
             continue
     return jsonify(rows)
 
+# [BANDIT] 평점 수집 엔드포인트 (선택)
+@app.post("/rate")
+def rate():
+    """
+    body 예시:
+    {
+      "kind": "coolest",
+      "rating": 4,                     // 1~5
+      "src": "36.3617,127.3447",
+      "dst": "36.3721,127.3452",
+      "time": "2025-08-18 14:00",
+      "metrics": {                     // 라우팅 당시의 값들 전달
+        "shortest": {"total_m":1234,"avg_shade_ratio":0.22},
+        "coolest":  {"total_m":1420,"avg_shade_ratio":0.61},
+        "shelter":  {"total_m":1550,"avg_shade_ratio":0.48}
+      }
+    }
+    """
+    try:
+        js = request.get_json(force=True, silent=True) or {}
+
+        # [DEBUG] 요청 JSON 출력
+        logger.debug("Received /rate payload: %s", json.dumps(js, ensure_ascii=False))
+
+        kind = str(js.get("kind","")).strip().lower()
+        rating = int(js.get("rating", 0))
+        src = _parse_coord_pair(str(js.get("src","")))
+        dst = _parse_coord_pair(str(js.get("dst","")))
+        time_s = str(js.get("time","")).strip()
+        metrics = js.get("metrics") or {}
+        if kind not in {"shortest","coolest","shelter"}:
+            return jsonify(error="invalid kind"), 400
+        if rating < 1 or rating > 5:
+            return jsonify(error="rating must be 1..5"), 400
+        if not src or not dst:
+            return jsonify(error="invalid src/dst"), 400
+
+        stamp = _stamp_from_time(time_s)
+        # features 재구성: 선택된 arm 기준, ref_dist는 세 후보 중 최소 거리
+        # (업데이트엔 x는 선택 arm의 x만 있으면 충분)
+        # metrics로 ref 기준 산정
+        ref_dist = min([m.get("total_m") for m in metrics.values() if m and m.get("total_m") is not None] or [None]) or None
+        chosen_meta = metrics.get(kind, {}) if isinstance(metrics, dict) else {}
+        cand = Candidate(kind=kind,
+                         total_m=chosen_meta.get("total_m"),
+                         avg_shade=chosen_meta.get("avg_shade_ratio"))
+        x = BANDIT.make_features(stamp, cand, ref_dist)
+        reward = (rating - 1) / 4.0  # 1→0.0, 5→1.0
+
+        logger.debug("Bandit.update(stamp=%s, kind=%s, reward=%.2f, src=%s, dst=%s, x=%s, meta=%s)",
+             stamp, kind, reward, src, dst, x, metrics)
+
+        BANDIT.update(stamp, kind, reward, src, dst, x, meta=metrics)
+        return jsonify(ok=True)
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+
+@app.get("/debug/shelter")
+def debug_shelter():
+    """ 예: /debug/shelter?src=36.36,127.34&dst=36.37,127.34&time=2025-08-18 14:00 """
+    src_s = request.args.get("src","").strip()
+    dst_s = request.args.get("dst","").strip()
+    time_s= request.args.get("time","").strip()
+    src = _parse_coord_pair(src_s); dst = _parse_coord_pair(dst_s)
+    if not src or not dst:
+        return jsonify(error="Invalid src/dst"), 400
+    stamp = _stamp_from_time(time_s)
+    union_table = f"shadow_union_{stamp}"
+    try:
+        best, dbg = _fetch_route_via_shelter(PG_URL, src, dst, union_table, debug=True)
+        return jsonify({
+            "stamp": stamp,
+            "union_table": union_table,
+            "shelter_table": _validate_table("shadow_shelter", stamp),
+            "best_exists": bool(best),
+            "debug": dbg
+        })
+    except Exception as e:
+        return jsonify(error=str(e)), 500
 
 
 if __name__ == "__main__":
